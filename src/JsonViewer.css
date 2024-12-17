@@ -1,0 +1,32 @@
+
+.json-viewer {
+    margin: 20px;
+}
+
+.json-viewer h2 {
+    margin-bottom: 10px;
+}
+
+.json-display {
+    max-height: 400px;
+    overflow-y: auto;
+    background-color: #f5f5f5;
+    padding: 10px;
+    border: 1px solid #ddd;
+    margin-bottom: 10px;
+    border-radius: 4px;
+}
+
+.download-button {
+    padding: 10px 20px;
+    font-size: 16px;
+    cursor: pointer;
+    background-color: #4CAF50; /* Grüner Hintergrund */
+    color: white; /* Weiße Schrift */
+    border: none;
+    border-radius: 4px;
+}
+
+.download-button:hover {
+    background-color: #45a049; /* Dunkleres Grün beim Hover */
+}

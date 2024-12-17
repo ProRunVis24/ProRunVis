@@ -1,6 +1,4 @@
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-.idea
-.vscode
 
 # IDE specific
 .idea
@@ -28,5 +26,20 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-#gradle
+# Gradle
 .gradle
+build
+
+# Ignore test result files
+/prorunvis/src/test/testfiles/preprocess/*result/
+/prorunvis/src/test/testfiles/compileandrun/*result/
+/prorunvis/src/test/testfiles/instrument/*result/
+/prorunvis/src/test/testfiles/traceprocessor/returntest/*
+!/prorunvis/src/test/testfiles/traceprocessor/returntest/resources/in/
+/prorunvis/src/test/testfiles/traceprocessor/breakcontinuetest/*
+!/prorunvis/src/test/testfiles/traceprocessor/breakcontinuetest/resources/in/
+/prorunvis/src/test/testfiles/traceprocessor/throwtest/*
+!/prorunvis/src/test/testfiles/traceprocessor/throwtest/resources/in/
+
+# Ignore temporary folders for testing
+resources
