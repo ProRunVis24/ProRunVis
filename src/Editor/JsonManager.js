@@ -1,5 +1,5 @@
 import TraceNode from "./TraceNode";
-import {editor, Position} from "monaco-editor";
+import { editor, Position } from "monaco-editor";
 
 /**
  * Class that contains an array of {@link TraceNode}s and manages them. It gives access to several functions that
@@ -72,6 +72,14 @@ class JsonManager {
     }
 
     /**
+     * Gibt die JSON-Daten (nodes) zurück.
+     * @returns {Array} Array der TraceNode-Objekte.
+     */
+    getJsonData() {
+        return this.nodes;
+    }
+
+    /**
      * Returns the index of the main function in nodes.
      * @returns {number}
      */
@@ -85,7 +93,7 @@ class JsonManager {
         let currentIndex = nodeIndex;
         let currentNode = this.nodes[currentIndex];
         while (currentNode.nodeType !== "Function") {
-            currentIndex = currentNode.parentIndex;
+            currentIndex = this.nodes[currentIndex].parentIndex;
             currentNode = this.nodes[currentIndex];
         }
         return currentIndex;
@@ -160,10 +168,10 @@ class JsonManager {
         }
         if (!skip) {
             this.nodes[nodeIndex].childrenIndices.forEach((childIndex) => {
-                this.activeIterations.concat(this.getIterations(childIndex));
+                this.activeIterations = this.activeIterations.concat(this.getIterations(childIndex));
             });
         }
-    };
+    }
 
     /**
      * Determines all function and throw nodes contained in the currently active function and calculates whether they
@@ -203,6 +211,7 @@ class JsonManager {
             jumps.push(nodeIndex);
         if ((!(this.nodes[nodeIndex].nodeType === "Loop") ||
             nodeIndex === this.activeIterations[0])) {
+
             if (this.nodes[nodeIndex].nodeType === "Loop") {
                 this.activeIterations.shift();
                 this.skipIds.push(this.nodes[nodeIndex].traceId);

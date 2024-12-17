@@ -1,7 +1,8 @@
-import React, {useEffect, useRef, useState, useMemo} from "react";
+import React, { useState, useEffect } from "react";
 import DirectoryBar from "./WebsiteElements/DirectoryBar";
 import EditorManager from "./Editor/EditorManager";
 import JsonManager from "./Editor/JsonManager";
+import JsonViewer from "./JsonViewer"; // Importiere die JsonViewer-Komponente
 
 /**
  * Contains both the right and left component. It handles communication between the two, mainly regarding changes in
@@ -15,6 +16,7 @@ function WebsiteContainer() {
     const [activeFile, setActiveFile] = useState(null);
     const [jsonManager, setJsonManager] = useState(null);
     const [uploadedFiles, setUploadedFiles] = useState([]);
+    const [jsonData, setJsonData] = useState(null); // State für die JSON-Daten
 
     /**
      * Changes both the current active and current displayed file to the file located at the given filepath.
@@ -52,25 +54,42 @@ function WebsiteContainer() {
      * @param files project files to be traced.
      */
     async function passOnUploadedFiles(files){
-            setUploadedFiles(files);
+        setUploadedFiles(files);
 
-            await fetch("/api/upload",{
-                method: "POST",
-                body: new FormData(document.getElementById("upload-form"))
-            });
+        await fetch("/api/upload",{
+            method: "POST",
+            body: new FormData(document.getElementById("upload-form"))
+        });
 
-            await fetch("/api/process")
-                .then((response) => response.json())
-                .then((jsonData) => setJsonManager(new JsonManager(jsonData)));
-            }
+        await fetch("/api/process")
+            .then((response) => response.json())
+            .then((jsonData) => setJsonManager(new JsonManager(jsonData)));
+    }
 
+    // useEffect, um jsonData zu setzen, wenn jsonManager sich ändert
+    useEffect(() => {
+        if (jsonManager) {
+            setJsonData(jsonManager.getJsonData());
+        }
+    }, [jsonManager]);
 
-    return <>
-        <DirectoryBar setDisplayedFile={setDisplayedFile} setDisplayedToActive={setDisplayedToActive}
-                      passOnUploadedFiles={passOnUploadedFiles}/>
-        <EditorManager displayedFile={displayedFile} setActiveAndDisplayed={setActiveAndDisplayed}
-                       isActiveDisplayed={isActiveDisplayed} jsonManager={jsonManager}/>
-    </>
+    return (
+        <>
+            <DirectoryBar
+                setDisplayedFile={setDisplayedFile}
+                setDisplayedToActive={setDisplayedToActive}
+                passOnUploadedFiles={passOnUploadedFiles}
+            />
+            <EditorManager
+                displayedFile={displayedFile}
+                setActiveAndDisplayed={setActiveAndDisplayed}
+                isActiveDisplayed={isActiveDisplayed}
+                jsonManager={jsonManager}
+            />
+            {/* Füge die JsonViewer-Komponente hinzu */}
+            {jsonData && <JsonViewer jsonData={jsonData} />}
+        </>
+    );
 }
 
 export default WebsiteContainer;
