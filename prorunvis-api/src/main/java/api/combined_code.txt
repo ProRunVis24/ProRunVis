@@ -1,0 +1,1535 @@
+package api.repository;
+
+import api.model.TraceData;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface TraceDataRepository extends JpaRepository<TraceData, Long> {
+}package api.repository;
+
+import api.model.ProcessedTrace;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProcessedTraceRepository extends JpaRepository<ProcessedTrace, Long> {
+}package api.repository;
+
+import api.model.InstrumentedCode;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface InstrumentedCodeRepository extends JpaRepository<InstrumentedCode, Long> {
+}package api.functionality;
+
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.utils.ProjectRoot;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import api.upload.storage.StorageProperties;
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+public class StaticMethodExtractorService {
+
+    private final File sourceDir;
+
+    public StaticMethodExtractorService(StorageProperties properties) {
+        // Uses the "in" location from your storage properties
+        this.sourceDir = Paths.get(properties.getLocation()).toFile();
+    }
+
+    public List<MethodInfo> extractMethods() {
+        // Configure JavaParser to use a symbol solver
+        StaticJavaParser.getParserConfiguration().setSymbolResolver(
+                new JavaSymbolSolver(new CombinedTypeSolver())
+        );
+        ProjectRoot projectRoot = new SymbolSolverCollectionStrategy().collect(sourceDir.toPath());
+        List<MethodInfo> methods = new ArrayList<>();
+
+        // Iterate over all source roots and parse them
+        projectRoot.getSourceRoots().forEach(sourceRoot -> {
+            try {
+                sourceRoot.tryToParse().forEach(cuResult -> {
+                    cuResult.getResult().ifPresent(cu -> {
+                        // For each method declaration found in the compilation unit, add its info
+                        cu.findAll(MethodDeclaration.class).forEach(md -> {
+                            String methodName = md.getNameAsString();
+                            String range = md.getRange().map(Object::toString).orElse("No Range");
+                            String file = cu.getStorage()
+                                    .map(storage -> storage.getPath().toString())
+                                    .orElse("Unknown File");
+                            methods.add(new MethodInfo(methodName, range, file));
+                        });
+                    });
+                });
+            } catch (IOException e) {
+                throw new RuntimeException("Error parsing source files", e);
+            }
+        });
+        return methods;
+    }
+
+    public String toJSON() {
+        List<MethodInfo> methods = extractMethods();
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        return gson.toJson(methods);
+    }
+
+    // Inner class to represent method information
+    public static class MethodInfo {
+        private String methodName;
+        private String range; // Represented as a String for easy JSON serialization
+        private String file;
+
+        public MethodInfo(String methodName, String range, String file) {
+            this.methodName = methodName;
+            this.range = range;
+            this.file = file;
+        }
+
+        // Getters (setters can be added if needed)
+        public String getMethodName() {
+            return methodName;
+        }
+
+        public String getRange() {
+            return range;
+        }
+
+        public String getFile() {
+            return file;
+        }
+    }
+}package api.functionality;
+
+
+import api.functionality.process.ProcessingException;
+import api.functionality.process.ProcessingService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.ResponseBody;
+
+@Controller
+public class ProcessingController {
+
+    /**
+     * The processing service used by this controller.
+     */
+    private final ProcessingService processingService;
+
+    /**
+     * @param processingService The processing service which this controller
+     *                          will use for handling the processing of the
+     *                          given input.
+     */
+    @Autowired
+    public ProcessingController(final ProcessingService processingService) {
+        this.processingService = processingService;
+    }
+
+
+    /**
+     * Handles the processing of provided data. The data will be processed as
+     * provided by the used {@link ProcessingService} of this controller.
+     *
+     * @return A JSON-String representation of the processed data.
+     */
+    @GetMapping("api/process")
+    @ResponseBody
+    public String getProcessingData() {
+        if (!processingService.isReady()) {
+            throw new ProcessingException("No Data has been uploaded!");
+        }
+        processingService.instrument();
+        processingService.trace();
+        processingService.process();
+        return processingService.toJSON();
+    }
+
+    /**
+     * An ExceptionHandler for handling {@link ProcessingException}s.
+     * If an exceptions occurs, this handler returns a string representation of
+     * the message and cause.
+     *
+     * @param e The thrown exception.
+     * @return The message and cause of the exception as String.
+     */
+    @ExceptionHandler(ProcessingException.class)
+    @ResponseBody
+    public String handleException(final ProcessingException e) {
+        String error = e.getMessage() + "\n";
+        if (e.getCause() != null) {
+            error += "\n" + e.getCause() + "\n";
+        }
+
+        return error;
+    }
+}
+package api.functionality.process;
+
+public interface ProcessingService {
+
+    /**
+     * Checks if data can be processed.
+     *
+     * @return true if data can be processed, false otherwise.
+     */
+    boolean isReady();
+
+    /**
+     * Instruments data by using the provided functions of
+     * the ProRunVis library.
+     */
+    void instrument();
+
+    /**
+     * Traces code by using provided functions of the
+     * ProRunVis library.
+     */
+    void trace();
+
+    /**
+     * Processes the traced data by using provided
+     * functions of the ProRunVis library.
+     */
+    void process();
+
+    /**
+     * Converts a processed trace to a JSON representation.
+     *
+     * @return A String containing the JSON representation.
+     */
+    String toJSON();
+}
+package api.functionality.process;
+
+import api.upload.storage.StorageProperties;
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
+import com.github.javaparser.utils.ProjectRoot;
+import com.google.gson.Gson;
+import org.springframework.stereotype.Service;
+import prorunvis.CompileAndRun;
+import prorunvis.instrument.Instrumenter;
+import prorunvis.preprocess.Preprocessor;
+import prorunvis.trace.TraceNode;
+import prorunvis.trace.process.TraceProcessor;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+
+@Service
+public final class SingleRunProcessingService implements ProcessingService {
+
+    /**
+     * The location where input data is stored.
+     */
+    private final Path inLocation;
+
+    /**
+     * The location for storing temporary output data.
+     */
+    private final Path outLocation;
+
+    /**
+     * A List of {@link CompilationUnit}s.
+     */
+    private List<CompilationUnit> cus;
+
+    /**
+     * A File containing the trace of a program run.
+     */
+    private File traceFile;
+
+    /**
+     * A HashMap containing {@link Node} objects mapped to
+     * their trace IDs.
+     */
+    private HashMap<Integer, Node> traceMap;
+
+    /**
+     * A List of {@link TraceNode} objects as provided by the
+     * {@link TraceProcessor} of the ProRunVis library.
+     */
+    private List<TraceNode> nodes;
+
+    /**
+     * Constructs a ProcessingService for processing a single program
+     * run.
+     *
+     * @param properties The StorageProperties for input and output
+     *                   locations.
+     */
+    public SingleRunProcessingService(final StorageProperties properties) {
+        if (properties.getLocation().trim().isEmpty()) {
+            throw new ProcessingException("Cannot process empty directory.");
+        }
+
+        inLocation = Paths.get(properties.getLocation());
+        outLocation = Paths.get(properties.getOutLocation());
+    }
+    @Override
+    public boolean isReady() {
+        return inLocation.toFile().exists()
+                && inLocation.toFile().isDirectory()
+                && Objects.requireNonNull(inLocation.toFile().listFiles()).length > 0;
+    }
+
+    @Override
+    public void instrument() {
+        //setup parser and trace file
+        StaticJavaParser.getParserConfiguration().setSymbolResolver(new JavaSymbolSolver(new CombinedTypeSolver()));
+        ProjectRoot projectRoot =
+                new SymbolSolverCollectionStrategy().collect(inLocation);
+
+        traceFile = new File(outLocation.toString() + "/Trace.tr");
+        Instrumenter.setupTrace(traceFile);
+
+        //run parser and collect compilation units
+        cus = new ArrayList<>();
+        projectRoot.getSourceRoots().forEach(sr -> {
+            try {
+                sr.tryToParse().forEach(cu -> cus.add(cu.getResult().orElseThrow()));
+            } catch (IOException | NoSuchElementException e) {
+                throw new ProcessingException("Cannot parse provided input.", e);
+            }
+        });
+
+        traceMap = new HashMap<>();
+        cus.forEach(cu -> {
+            Preprocessor.run(cu);
+            Instrumenter.run(cu, traceMap);
+        });
+        Instrumenter.saveInstrumented(projectRoot, outLocation.toString() + "/instrumented");
+    }
+
+    @Override
+    public void trace() {
+        try {
+            CompileAndRun.run(cus, outLocation.toString() + "/instrumented",
+                    outLocation.toString() + "/compiled");
+        } catch (IOException | InterruptedException | ArrayIndexOutOfBoundsException e) {
+            throw new ProcessingException(e.getMessage());
+        }
+    }
+
+    @Override
+    public void process() {
+        TraceProcessor processor = new TraceProcessor(traceMap, traceFile.getPath(), inLocation);
+        try {
+            processor.start();
+        } catch (IOException e) {
+            throw new ProcessingException("An error occurred during processing of the trace.", e);
+        }
+        nodes = processor.getNodeList();
+    }
+
+    @Override
+    public String toJSON() {
+        Gson gson = new Gson();
+        String response = gson.toJson(nodes);
+        //replace \\ from windows paths with / for webkit directory
+        return response.replace("\\\\", "/");
+    }
+}
+package api.functionality.process;
+
+public class ProcessingException extends RuntimeException {
+
+    /**
+     * Constructs a ProcessingException with the specified detail message.
+     *
+     * @param message The detail message (which is saved for later retrieval
+     *                by the {@link #getMessage()} method)
+     */
+    public ProcessingException(final String message) {
+        super(message);
+    }
+
+    /**
+     * Constructs a ProcessingException with the specified detail message
+     * and cause.
+     *
+     * @param message The detail message (which is saved for later retrieval
+     *                by the {@link #getMessage()} method)
+     * @param cause   The cause (which is saved for later retrieval by the
+     *                {@link #getCause()} method).  (A null value is permitted,
+     *                and indicates that the cause is nonexistent or unknown.)
+     */
+    public ProcessingException(final String message, final Throwable cause) {
+        super(message, cause);
+    }
+}
+package api.controller;
+
+import api.service.VisualizationService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * Returns JSON from the processedTrace.json file in local_storage/<localId>.
+ */
+@RestController
+@RequestMapping("/api/visualize")
+public class VisualizationController {
+
+    private final VisualizationService service;
+    private final ObjectMapper objectMapper;
+
+    public VisualizationController(VisualizationService service) {
+        this.service = service;
+        this.objectMapper = new ObjectMapper();
+    }
+
+    /**
+     * We pass a local ID referencing the folder with processedTrace.json.
+     *
+     * 1) We read the raw JSON string from VisualizationService.
+     * 2) Parse it into an Object so Spring can produce real JSON with correct Content-Type.
+     */
+    @GetMapping(value = "/{localId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<Object> getTraceJson(@PathVariable String localId) {
+        String rawJson = service.getTraceJson(localId);
+        try {
+            // Convert the raw JSON string to a generic Object
+            Object jsonObj = objectMapper.readValue(rawJson, Object.class);
+            // Return as JSON, 200 OK
+            return ResponseEntity.ok(jsonObj);
+        } catch (Exception e) {
+            // If parse fails or file is invalid, return 500
+            return ResponseEntity
+                    .status(500)
+                    .body("Failed to parse processedTrace.json: " + e.getMessage());
+        }
+    }
+}package api.controller;
+
+import api.service.TracingService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/trace")
+public class TraceController {
+
+    private final TracingService service;
+
+    public TraceController(TracingService service) {
+        this.service = service;
+    }
+
+    /**
+     * The client calls: POST /api/trace?instrumentId=<shortId>
+     * We do NOT return a big absolute path anymore.
+     * Instead, we just return the same short ID so the user can
+     * pass it to /api/process later.
+     */
+    @PostMapping
+    public String runTrace(@RequestParam String instrumentId) {
+        // This will decode and produce the trace file "Trace.tr"
+        // in local_storage/<instrumentId>/Trace.tr.
+        service.runTrace(instrumentId);
+
+        // Instead of returning an absolute path, we now just return the same short ID.
+        return instrumentId;
+    }
+}package api.controller;
+
+import api.service.ProcessingService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/process")
+public class ProcessController {
+
+    private final ProcessingService processingService;
+
+    public ProcessController(ProcessingService processingService) {
+        this.processingService = processingService;
+    }
+
+    /**
+     * POST /api/process?traceId=<shortId>
+     *
+     * We'll read local_storage/<shortId>/Trace.tr,
+     * produce processedTrace.json, store it in the same folder,
+     * and return the shortId (or path) for the next step.
+     */
+    @PostMapping
+    public String processTrace(@RequestParam String traceId) {
+        // run the processing
+        processingService.processTrace(traceId);
+
+        // return the same short ID for the front end
+        // so the front end can do a GET /api/visualize/<traceId> if desired
+        return traceId;
+    }
+}package api.controller;
+
+import api.service.InstrumentationService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/instrument")
+public class InstrumentController {
+    private final InstrumentationService service;
+
+    public InstrumentController(InstrumentationService service) {
+        this.service = service;
+    }
+
+    /**
+     * Now returns a String ID referencing a local folder
+     * instead of a DB primary key.
+     */
+    @PostMapping
+    public String instrumentProject(
+            @RequestParam String projectName,
+            @RequestParam(required = false) String inputDir
+    ) {
+        // If inputDir not provided, use some default
+        if (inputDir == null || inputDir.isEmpty()) {
+            inputDir = "/Users/yourname/Somewhere/defaultProjectDir";
+        }
+
+        // Generate a unique ID (could be a timestamp, but here we use UUID)
+        String randomId = UUID.randomUUID().toString();
+
+        // Instrument the code, storing results in local folder named after randomId
+        // Notice we now pass `randomId` to the service
+        service.instrumentProject(projectName, inputDir, randomId);
+
+        // Return that ID so the frontend can pass it to subsequent endpoints
+        return randomId;
+    }
+}package api.controller;
+
+import api.functionality.StaticMethodExtractorService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class StaticMethodController {
+
+    private final StaticMethodExtractorService extractorService;
+
+    @Autowired
+    public StaticMethodController(StaticMethodExtractorService extractorService) {
+        this.extractorService = extractorService;
+    }
+
+    // Expose an endpoint that returns the static methods JSON
+    @GetMapping("/api/static-methods")
+    public String getStaticMethods() {
+        return extractorService.toJSON();
+    }
+}package api.model;
+
+import jakarta.persistence.*;
+
+@Entity
+public class ProcessedTrace {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private Long traceDataId;
+
+    @Lob
+    private String processedJson;
+
+    public Long getId() {
+        return id;
+    }
+
+    public Long getTraceDataId() {
+        return traceDataId;
+    }
+
+    public String getProcessedJson() {
+        return processedJson;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public void setTraceDataId(Long traceDataId) {
+        this.traceDataId = traceDataId;
+    }
+
+    public void setProcessedJson(String processedJson) {
+        this.processedJson = processedJson;
+    }
+}package api.model;
+
+import jakarta.persistence.*;
+
+@Entity
+public class InstrumentedCode {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String projectName;
+
+    @Lob
+    private String instrumentedSourceZip; // base64-encoded ZIP of instrumented source
+
+    @Lob
+    private String nodeMapJson; // If you need to store the node map JSON from instrumentation
+
+    public Long getId() {
+        return id;
+    }
+
+    public String getProjectName() {
+        return projectName;
+    }
+
+    public String getInstrumentedSourceZip() {
+        return instrumentedSourceZip;
+    }
+
+    public String getNodeMapJson() {
+        return nodeMapJson;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public void setProjectName(String projectName) {
+        this.projectName = projectName;
+    }
+
+    public void setInstrumentedSourceZip(String instrumentedSourceZip) {
+        this.instrumentedSourceZip = instrumentedSourceZip;
+    }
+
+    public void setNodeMapJson(String nodeMapJson) {
+        this.nodeMapJson = nodeMapJson;
+    }
+}package api.model;
+
+import jakarta.persistence.*;
+
+@Entity
+public class TraceData {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private Long instrumentedCodeId;
+
+    @Lob
+    private String traceFileContent;
+
+    public Long getId() {
+        return id;
+    }
+
+    public Long getInstrumentedCodeId() {
+        return instrumentedCodeId;
+    }
+
+    public String getTraceFileContent() {
+        return traceFileContent;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public void setInstrumentedCodeId(Long instrumentedCodeId) {
+        this.instrumentedCodeId = instrumentedCodeId;
+    }
+
+    public void setTraceFileContent(String traceFileContent) {
+        this.traceFileContent = traceFileContent;
+    }
+}package api.service;
+
+import com.github.javaparser.ast.CompilationUnit;
+import org.springframework.stereotype.Service;
+import prorunvis.CompileAndRun;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.List;
+
+/**
+ * This service:
+ *  1) Reads base64-encoded instrumented code from
+ *     resources/local_storage/<instrumentId>/instrumented_base64.txt
+ *  2) Decodes/unzips into resources/out/downloaded_instrumented
+ *  3) Compiles and runs the code => Trace.tr
+ *  4) Copies Trace.tr into local_storage/<instrumentId>/Trace.tr
+ */
+@Service
+public class TracingService {
+
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    public TracingService() {
+        // no DB repos needed
+    }
+
+    /**
+     * Clears out resources/out to ensure a fresh decode/unzip + compile/run.
+     */
+    private void cleanOutputDirectories() {
+        File outDir = new File("resources/out");
+        if (outDir.exists()) {
+            try {
+                org.springframework.util.FileSystemUtils.deleteRecursively(outDir.toPath());
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to clean output directories", e);
+            }
+        }
+        if (!outDir.mkdirs()) {
+            throw new RuntimeException("Failed to create output directory after cleaning.");
+        }
+    }
+
+    /**
+     * Decode, compile, run, produce Trace.tr inside local_storage/<instrumentId>.
+     *
+     * We do NOT return an absolute path here. We'll just do it as a void
+     * or you could still do a `return instrumentId;` if you want.
+     */
+    public void runTrace(String instrumentId) {
+        // local_storage/<instrumentId>
+        File localIdFolder = new File(LOCAL_STORAGE_DIR, instrumentId);
+        if (!localIdFolder.exists() || !localIdFolder.isDirectory()) {
+            throw new RuntimeException("Local ID folder does not exist: " + localIdFolder.getAbsolutePath());
+        }
+
+        // local_storage/<instrumentId>/instrumented_base64.txt
+        File base64File = new File(localIdFolder, "instrumented_base64.txt");
+        if (!base64File.exists()) {
+            throw new RuntimeException("No instrumented_base64.txt found for ID: " + instrumentId);
+        }
+
+        // 1) Read the base64 content
+        String base64 = Util.readFileAsString(base64File);
+
+        // 2) decode/unzip into resources/out/downloaded_instrumented
+        cleanOutputDirectories();
+        File instrumentedDir = Util.unzipAndDecode(base64);
+
+        // 3) compile + run
+        List<CompilationUnit> cus = Util.loadCUs(instrumentedDir);
+        try {
+            CompileAndRun.run(
+                    cus,
+                    instrumentedDir.getAbsolutePath(),
+                    instrumentedDir.getAbsolutePath() + "/compiled"
+            );
+        } catch (Exception e) {
+            throw new RuntimeException("Trace run failed.", e);
+        }
+
+        // 4) check for Trace.tr INSIDE THE "compiled" SUBFOLDER
+        File compiledFolder = new File(instrumentedDir, "compiled");
+        File traceFile = new File(compiledFolder, "Trace.tr");
+
+        if (!traceFile.exists()) {
+            throw new RuntimeException(
+                    "No Trace.tr found in: " + compiledFolder.getAbsolutePath());
+        }
+        System.out.println("Trace file generated at: " + traceFile.getAbsolutePath());
+
+        // 5) copy Trace.tr → local_storage/<instrumentId>/Trace.tr
+        File localTrace = new File(localIdFolder, "Trace.tr");
+        try {
+            Files.copy(
+                    traceFile.toPath(),
+                    localTrace.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING
+            );
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "Failed copying Trace.tr to: " + localTrace.getAbsolutePath(),
+                    e
+            );
+        }
+    }
+}package api.service;
+
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.utils.ProjectRoot;
+import com.google.gson.Gson;
+import org.springframework.stereotype.Service;
+import prorunvis.trace.TraceNode;
+import prorunvis.trace.process.TraceProcessor;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Service
+public class ProcessingService {
+
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    /**
+     * We do NOT return a path anymore. We'll just do it as `void`
+     * or you can still return the path to "processedTrace.json" if you want.
+     */
+    public void processTrace(String traceId) {
+        // 1) local_storage/<traceId> folder
+        File localIdFolder = new File(LOCAL_STORAGE_DIR, traceId);
+        if (!localIdFolder.exists() || !localIdFolder.isDirectory()) {
+            throw new RuntimeException("Local ID folder does not exist: " + localIdFolder.getAbsolutePath());
+        }
+
+        // 2) local_storage/<traceId>/Trace.tr must exist
+        File traceFile = new File(localIdFolder, "Trace.tr");
+        if (!traceFile.exists()) {
+            throw new RuntimeException("Trace file not found: " + traceFile.getAbsolutePath());
+        }
+
+        // 3) re-parse code from resources/out/instrumented
+        // (or wherever your instrumented code remains)
+        Path codeRoot = Paths.get("resources/in");
+        ProjectRoot projectRoot = Util.parseProject(codeRoot.toFile());
+        List<CompilationUnit> cus = Util.getCUs(projectRoot);
+
+        // 4) build the map
+        Map<Integer, Node> map = new HashMap<>();
+        for (CompilationUnit cu : cus) {
+            prorunvis.preprocess.Preprocessor.run(cu);
+            prorunvis.instrument.Instrumenter.run(cu, map);
+        }
+
+        // 5) run the TraceProcessor
+        TraceProcessor processor =
+                new TraceProcessor(map, traceFile.getAbsolutePath(), codeRoot);
+
+        try {
+            processor.start();
+        } catch (Exception e) {
+            throw new RuntimeException("Processing failed: " + e.getMessage(), e);
+        }
+
+        // 6) convert the final node list to JSON
+        List<TraceNode> nodeList = processor.getNodeList();
+        String json = new Gson().toJson(nodeList);
+
+        // 7) store processedTrace.json in local_storage/<traceId>/processedTrace.json
+        File outputJson = new File(localIdFolder, "processedTrace.json");
+        try (FileOutputStream fos = new FileOutputStream(outputJson)) {
+            fos.write(json.getBytes());
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write processedTrace.json at: " + outputJson.getAbsolutePath(), e);
+        }
+
+        System.out.println("Processing complete. JSON stored at: " + outputJson.getAbsolutePath());
+    }
+}package api.service;
+
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
+import com.github.javaparser.utils.ProjectRoot;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Base64;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+public class Util {
+
+    public static ProjectRoot parseProject(File inputDir) {
+        StaticJavaParser.getConfiguration().setSymbolResolver(new JavaSymbolSolver(new CombinedTypeSolver()));
+        return new SymbolSolverCollectionStrategy().collect(inputDir.toPath());
+    }
+
+    public static List<CompilationUnit> getCUs(ProjectRoot projectRoot) {
+        return projectRoot.getSourceRoots().stream()
+                .flatMap(sr -> {
+                    try {
+                        return sr.tryToParse().stream().filter(res -> res.getResult().isPresent()).map(res -> res.getResult().get());
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                })
+                .collect(Collectors.toList());
+    }
+
+    public static String zipAndEncode(ProjectRoot projectRoot) {
+        // This zips the instrumented code output (assuming saved in "resources/out/instrumented")
+        File instrumentedDir = new File("resources/out/instrumented");
+        if (!instrumentedDir.exists()) {
+            throw new RuntimeException("Instrumented directory not found.");
+        }
+
+        File zipFile = new File("instrumented.zip");
+        zipDirectory(instrumentedDir, zipFile);
+        byte[] content;
+        try {
+            content = Files.readAllBytes(zipFile.toPath());
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        return Base64.getEncoder().encodeToString(content);
+    }
+
+    public static void zipDirectory(File sourceDir, File zipFile) {
+        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(zipFile))) {
+            Path sourcePath = sourceDir.toPath();
+
+            Files.walk(sourcePath)
+                    .filter(p -> !Files.isDirectory(p))
+                    .forEach(path -> {
+                        ZipEntry zipEntry = new ZipEntry(sourcePath.relativize(path).toString());
+                        try {
+                            zos.putNextEntry(zipEntry);
+                            Files.copy(path, zos);
+                            zos.closeEntry();
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static File unzipAndDecode(String base64Zip) {
+        // For simplicity, we'll just write out the zip and manually extract it
+        byte[] data = Base64.getDecoder().decode(base64Zip);
+        File zipFile = new File("instrumented_downloaded.zip");
+        try {
+            Files.write(zipFile.toPath(), data);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        File outputDir = new File("resources/out/downloaded_instrumented");
+        if (!outputDir.exists()) {
+            outputDir.mkdirs();
+        }
+
+        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new FileInputStream(zipFile))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                File newFile = new File(outputDir, entry.getName());
+                newFile.getParentFile().mkdirs();
+                try (FileOutputStream fos = new FileOutputStream(newFile)) {
+                    zis.transferTo(fos);
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        return outputDir;
+    }
+
+    public static List<CompilationUnit> loadCUs(File instrumentedDir) {
+        ProjectRoot pr = parseProject(instrumentedDir);
+        return getCUs(pr);
+    }
+
+    public static String readFileAsString(File f) {
+        try {
+            return new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static File createTempTraceFile(String content) {
+        try {
+            File f = File.createTempFile("trace", ".tr");
+            Files.write(f.toPath(), content.getBytes(StandardCharsets.UTF_8));
+            return f;
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}package api.service;
+
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.utils.ProjectRoot;
+import org.springframework.stereotype.Service;
+import prorunvis.instrument.Instrumenter;
+import prorunvis.preprocess.Preprocessor;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * A reworked InstrumentationService that does NOT store data in a DB.
+ * Instead, it stores the instrumented code locally, keyed by a random ID.
+ */
+@Service
+public class InstrumentationService {
+
+    /**
+     * The base folder where we store each run's local data,
+     * keyed by a random ID (e.g. "resources/local_storage/<ID>").
+     */
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    public InstrumentationService() {
+        // No repository injection needed anymore.
+    }
+
+    /**
+     * Creates/cleans "resources/out" so the instrumentation can run
+     * from a clean slate. This is the same logic you had before.
+     */
+    private void ensureCleanOutputDirectories() {
+        File outDir = new File("resources/out");
+        if (outDir.exists()) {
+            System.out.println("Cleaning existing resources/out directory...");
+            try {
+                Files.walk(outDir.toPath())
+                        .map(java.nio.file.Path::toFile)
+                        .sorted((o1, o2) -> -o1.compareTo(o2)) // delete children first
+                        .forEach(File::delete);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to clean output directories", e);
+            }
+        }
+        if (!outDir.mkdirs()) {
+            throw new RuntimeException("Failed to create output directory at resources/out.");
+        }
+
+        File instrDir = new File("resources/out/instrumented");
+        if (!instrDir.exists() && !instrDir.mkdirs()) {
+            throw new RuntimeException("Failed to create instrumented directory at resources/out/instrumented.");
+        }
+    }
+
+    /**
+     * Instruments the code and stores results in "resources/local_storage/<randomId>/".
+     *
+     * @param projectName   the name of the user's project
+     * @param inputDirPath  the folder containing the source code to be instrumented
+     * @param randomId      a unique ID that we can use for storing output
+     * @return Some success message (or path).
+     */
+    public String instrumentProject(String projectName,
+                                    String inputDirPath,
+                                    String randomId) {
+
+        // 1) Verify input directory is valid
+        File inputDir = new File(inputDirPath);
+        if (!inputDir.exists() || !inputDir.isDirectory()) {
+            throw new RuntimeException("Input directory does not exist or is not a directory: " + inputDirPath);
+        }
+
+
+        // 2) Clean & set up "resources/out"
+        ensureCleanOutputDirectories();
+
+        // 3) Parse & instrument code
+        System.out.println("Parsing project at: " + inputDirPath);
+        ProjectRoot projectRoot = Util.parseProject(inputDir);
+        List<CompilationUnit> cus = Util.getCUs(projectRoot);
+        if (cus.isEmpty()) {
+            throw new RuntimeException("No Java files found in: " + inputDirPath);
+        }
+        System.out.println("Found " + cus.size() + " compilation units.");
+
+        Map<Integer, Node> map = new HashMap<>();
+        for (CompilationUnit cu : cus) {
+            Preprocessor.run(cu);
+            Instrumenter.run(cu, map);
+        }
+
+
+        // 5) Save instrumented code
+        Instrumenter.saveInstrumented(projectRoot, "resources/out/instrumented");
+
+        // 6) Check that something was indeed saved
+        File instrDir = new File("resources/out/instrumented");
+        String[] instrumentedFiles = instrDir.list();
+        if (instrumentedFiles == null || instrumentedFiles.length == 0) {
+            throw new RuntimeException("No files found in instrumented directory after saving instrumented code.");
+        }
+        System.out.println("Files in instrumented directory:");
+        for (String f : instrumentedFiles) {
+            System.out.println(" - " + f);
+        }
+
+        // 7) Zip & encode
+        System.out.println("Zipping instrumented code...");
+        String zipBase64 = Util.zipAndEncode(projectRoot);
+        if (zipBase64 == null || zipBase64.isEmpty()) {
+            throw new RuntimeException("Failed to zip instrumented code.");
+        }
+
+        // 8) Store the resulting Base64 in "resources/local_storage/<randomId>/instrumented.txt"
+        // Make a local folder for this randomId
+        File randomIdFolder = new File(LOCAL_STORAGE_DIR, randomId);
+        if (!randomIdFolder.exists()) {
+            randomIdFolder.mkdirs();
+        }
+        File outputFile = new File(randomIdFolder, "instrumented_base64.txt");
+        try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+            fos.write(zipBase64.getBytes());
+        } catch (IOException e) {
+            throw new RuntimeException("Error writing local instrumented file: " + e.getMessage(), e);
+        }
+
+        System.out.println("Instrumented code stored locally in: " + outputFile.getAbsolutePath());
+
+        // Return a success message
+        return "Instrumented code saved under ID=" + randomId
+                + " at: " + outputFile.getAbsolutePath();
+    }
+}package api.service;
+
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+
+/**
+ * Reworked VisualizationService to read from local processedTrace.json
+ * in resources/local_storage/<localId>/processedTrace.json.
+ */
+@Service
+public class VisualizationService {
+
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    public VisualizationService() {
+        // no repos needed
+    }
+
+    public String getTraceJson(String localId) {
+        // find resources/local_storage/<localId>/processedTrace.json
+        File localFolder = new File(LOCAL_STORAGE_DIR, localId);
+        if (!localFolder.exists() || !localFolder.isDirectory()) {
+            throw new RuntimeException("Local ID folder not found: " + localFolder.getAbsolutePath());
+        }
+        File processedFile = new File(localFolder, "processedTrace.json");
+        if (!processedFile.exists()) {
+            throw new RuntimeException("No processedTrace.json found for ID: " + localId);
+        }
+
+        try {
+            byte[] content = Files.readAllBytes(processedFile.toPath());
+            return new String(content, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read processedTrace.json", e);
+        }
+    }
+}package api;
+
+import api.upload.storage.StorageProperties;
+import api.upload.storage.StorageService;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+
+@SpringBootApplication
+@EnableConfigurationProperties(StorageProperties.class)
+public class ProRunVisAPI {
+
+    /**
+     * Starts a {@link SpringApplication} on localhost.
+     * @param args the argument list for the program.
+     */
+    public static void main(final String[] args) {
+        SpringApplication.run(ProRunVisAPI.class, args);
+    }
+
+    /**
+     * Automated initialization for a {@link StorageService} used
+     * by this {@link SpringApplication}.
+     * @param storageService the {@link StorageService} to
+     *                       initialize.
+     * @return a function calling the <code>deleteAll()</code>
+     *         and <code>init()</code> methods of the storageService
+     */
+    @Bean
+    CommandLineRunner init(final StorageService storageService) {
+        return (args) -> {
+            storageService.deleteAll();
+            storageService.init();
+        };
+    }
+}
+package api.upload.storage;
+
+import jakarta.servlet.http.Part;
+import org.apache.commons.io.FilenameUtils;
+import org.springframework.stereotype.Service;
+import org.springframework.util.FileSystemUtils;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+
+/**
+ * A Storage service used to store given data in a directory specified
+ * through a {@link StorageProperties} element.
+ */
+@Service
+public class FileSystemStorageService implements StorageService {
+
+    /**
+     * Path to rootLocation.
+     */
+    private final Path rootLocation;
+
+    /**
+     * Path to out location.
+     */
+    private final Path outLocation;
+
+    /**
+     * @param properties The storage properties for the storage service
+     */
+    public FileSystemStorageService(final StorageProperties properties) {
+        if (properties.getLocation().trim().isEmpty()) {
+            throw new StorageException("File storage directory cannot be empty.");
+        }
+
+        this.rootLocation = Paths.get(properties.getLocation());
+        if (properties.getOutLocation().trim().isEmpty()) {
+            this.outLocation = Paths.get("resources/out");
+        } else {
+            this.outLocation = Paths.get(properties.getOutLocation());
+        }
+    }
+
+    /**
+     * Initializes the storage service by creating the folders.
+     * specified by <code>rootLocation</code> and <code>outLocation</code>
+     */
+    @Override
+    public void init() {
+        try {
+            Files.createDirectories(rootLocation);
+            Files.createDirectories(outLocation);
+        } catch (IOException e) {
+            throw new StorageException("Could not create directory.", e);
+        }
+    }
+
+    /**
+     * Stores the contents of a file to a new {@link java.io.File}
+     * in the directory specified by <code>rootLocation</code>.
+     * @param part a part of a http-request representing a file
+     *             to be stored. If the file does not exist it is
+     *             created inside the rootLocation.
+     */
+    @Override
+    public void store(final Part part) {
+        try {
+            String fileName = FilenameUtils.separatorsToSystem(part.getSubmittedFileName());
+            Path file = rootLocation.resolve(fileName);
+
+            if (Files.notExists(file.getParent())) {
+                Files.createDirectories(file.getParent());
+            }
+
+            try (InputStream inputStream = part.getInputStream()) {
+                Files.copy(inputStream, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            throw new StorageException("Could not store file.", e);
+        }
+    }
+
+    /**
+     * Recursively deletes all files in the directory specified by
+     * <code>rootLocation</code> and <code>outLocation</code>
+     * using {@link FileSystemUtils}.
+     */
+    @Override
+    public void deleteAll() {
+        FileSystemUtils.deleteRecursively(rootLocation.toFile());
+        FileSystemUtils.deleteRecursively(outLocation.toFile());
+    }
+}
+package api.upload.storage;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+/**
+ * A property element to define a storage configuration.
+ */
+@ConfigurationProperties("storage")
+public class StorageProperties {
+
+    /**
+     * The location where newly uploaded files will be stored.
+     */
+    private String inLocation = "resources/in";
+
+    /**
+     * The location to use as storage for temporary output files.
+     */
+    private String outLocation = "resources/out";
+
+    /**
+     * Gets the {@code inLocation} field of this property object.
+     *
+     * @return The String representing the relative path to the
+     * inLocation.
+     */
+    public String getLocation() {
+        return this.inLocation;
+    }
+
+    /**
+     * Sets the {@code inLocation} field of this property element.
+     *
+     * @param location The String to set as inLocation.
+     */
+    public void setLocation(final String location) {
+        this.inLocation = location;
+    }
+
+    /**
+     * Gets the {@code outLocation} field of this property object.
+     *
+     * @return The String representing the relative path to the
+     * outLocation.
+     */
+    public String getOutLocation() {
+        return this.outLocation;
+    }
+
+    /**
+     * Sets the {@code outLocation} field of this property element.
+     *
+     * @param location The String to set as outLocation.
+     */
+    public void setOutLocation(final String location) {
+        this.outLocation = location;
+    }
+}
+package api.upload.storage;
+
+/**
+ * Signals that a storage exception has occurred.
+ */
+public class StorageException extends RuntimeException {
+
+    /**
+     * Constructs a StorageException with the specified detail message.
+     *
+     * @param message The detail message (which is saved for later retrieval
+     *                by the {@link #getMessage()} method)
+     */
+    public StorageException(final String message) {
+        super(message);
+    }
+
+    /**
+     * Constructs a StorageException with the specified detail message
+     * and cause.
+     *
+     * @param message The detail message (which is saved for later retrieval
+     *                by the {@link #getMessage()} method)
+     * @param cause   The cause (which is saved for later retrieval by the
+     *                {@link #getCause()} method).  (A null value is permitted,
+     *                and indicates that the cause is nonexistent or unknown.)
+     */
+    public StorageException(final String message, final Throwable cause) {
+        super(message, cause);
+    }
+}
+package api.upload.storage;
+
+import jakarta.servlet.http.Part;
+
+/**
+ * A Service for storing data provided from a http request.
+ * The user of this interface can create and delete all
+ * necessary directories and has control of the way each {@link Part}
+ * of the request is stored.
+ */
+public interface StorageService {
+
+    /**
+     * Initializes the storage location and structure used by this storage
+     * service element.
+     */
+    void init();
+
+    /**
+     * Stores data to the given storage location. This method should not be
+     * called without {@link #init()} having been called before.
+     * @param part The data to store. The data is provided in form of a
+     *             {@link Part} from a http request.
+     */
+    void store(Part part);
+
+    /**
+     * Deletes all data stored by this storage service or storage services
+     * which are providing the same storage location.
+     */
+    void deleteAll();
+}
+package api.upload;
+
+import api.upload.storage.StorageException;
+import api.upload.storage.StorageService;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.Part;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.ResponseBody;
+
+import java.io.IOException;
+
+/**
+ * A {@link Controller} used for handling files, that are uploaded
+ * to the server.
+ */
+@Controller
+public class UploadController {
+
+    /**
+     * The storage service used by this controller.
+     */
+    private final StorageService storageService;
+
+    /**
+     * @param storageService The storage service which this controller
+     *                       will use for handling file storage for
+     *                       uploaded files.
+     */
+    @Autowired
+    public UploadController(final StorageService storageService) {
+        this.storageService = storageService;
+    }
+
+
+    /**
+     * Handles hosting the default landing page. Always hosts
+     * index.html on the default path "/".
+     *
+     * @return A String representing the file to be hosted, which can
+     * be used by the thymeleaf plugin
+     */
+    @GetMapping("/")
+    public String getIndex() {
+        return "index.html";
+    }
+
+    /**
+     * Handles file uploads to the server. The files will be stored as
+     * provided by the used {@link StorageService} of this controller.
+     *
+     * @param request The Http request containing the uploaded files
+     *                as {@link Part}, which will be stored using the
+     *                provided {@link #storageService}.
+     */
+    @PostMapping("/api/upload")
+    @ResponseBody
+    public void handleUpload(final HttpServletRequest request) {
+
+        //ensure that no other files are contained within in/out
+        storageService.deleteAll();
+
+        try {
+            for (Part part : request.getParts()) {
+                storageService.store(part);
+            }
+        } catch (IOException | ServletException e) {
+            throw new StorageException("No files for upload selected.");
+        }
+    }
+
+    /**
+     * An ExceptionHandler for handling {@link StorageException}s.
+     * If an exceptions occurs, this handler returns a string representation of
+     * the message and cause.
+     *
+     * @param e The thrown exception.
+     * @return The message and cause of the exception as String.
+     */
+    @ExceptionHandler(StorageException.class)
+    @ResponseBody
+    public String handleException(final StorageException e) {
+        String error = e.getMessage() + "\n";
+        if (e.getCause() != null) {
+            error += "\n" + e.getCause() + "\n";
+        }
+
+        return error;
+    }
+}
