@@ -379,6 +379,45 @@ public class ProcessingException extends RuntimeException {
 }
 package api.controller;
 
+import api.service.JBMCService;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/jbmc")
+public class JBMCController {
+
+    private final JBMCService jbmcService;
+
+    public JBMCController(JBMCService jbmcService) {
+        this.jbmcService = jbmcService;
+    }
+
+    /**
+     * POST /api/jbmc/run?instrumentId=<localId>&methodSignature=<sig>&unwind=5&maxArray=5
+     * This triggers JBMC to run for that localId's compiled code.
+     */
+    @PostMapping("/run")
+    public ResponseEntity<String> runJBMC(@RequestParam("instrumentId") String instrumentId,
+                                          @RequestParam("methodSignature") String methodSignature,
+                                          @RequestParam(name = "unwind", defaultValue = "5") int unwind,
+                                          @RequestParam(name = "maxArray", defaultValue = "5") int maxArray) {
+        jbmcService.runJBMC(instrumentId, methodSignature, unwind, maxArray);
+        return ResponseEntity.ok("JBMC run complete. JSON stored in local_storage/" + instrumentId + "/jbmcOutput.json");
+    }
+
+    /**
+     * GET /api/jbmc/result/<instrumentId>
+     * Returns the raw JSON from JBMC's last run for that localId.
+     */
+    @GetMapping(value = "/result/{instrumentId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<String> getJBMCResult(@PathVariable String instrumentId) {
+        String jbmcJson = jbmcService.getJBMCOutput(instrumentId);
+        return ResponseEntity.ok(jbmcJson);
+    }
+}package api.controller;
+
 import api.service.VisualizationService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.http.MediaType;
@@ -1145,6 +1184,61 @@ public class InstrumentationService {
     }
 }package api.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Example utility to parse JBMC "trace" steps for variable assignments.
+ */
+public class JBMCParser {
+
+    /**
+     * Return a list of (variableName, value) pairs from the JBMC JSON "trace.steps"
+     */
+    public static List<VarAssignment> parseVariableAssignments(String jbmcJson) {
+        List<VarAssignment> result = new ArrayList<>();
+        ObjectMapper mapper = new ObjectMapper();
+        try {
+            JsonNode root = mapper.readTree(jbmcJson);
+            // Typically "result" array, each with "trace.steps"
+            if (root.has("result") && root.get("result").isArray()) {
+                for (JsonNode r : root.get("result")) {
+                    if (r.has("trace")) {
+                        JsonNode steps = r.get("trace").get("steps");
+                        if (steps != null && steps.isArray()) {
+                            for (JsonNode step : steps) {
+                                if (step.has("stepType") && "assignment".equals(step.get("stepType").asText())) {
+                                    String lhs = step.has("lhs") ? step.get("lhs").asText() : "<no_var>";
+                                    String val = step.has("value") ? step.get("value").asText() : "<no_val>";
+                                    result.add(new VarAssignment(lhs, val));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to parse JBMC JSON", e);
+        }
+
+        return result;
+    }
+
+    public static class VarAssignment {
+        public String variableName;
+        public String value;
+
+        public VarAssignment(String variableName, String value) {
+            this.variableName = variableName;
+            this.value = value;
+        }
+    }
+}package api.service;
+
 import org.springframework.stereotype.Service;
 
 import java.io.File;
@@ -1181,6 +1275,150 @@ public class VisualizationService {
             return new String(content, StandardCharsets.UTF_8);
         } catch (IOException e) {
             throw new RuntimeException("Failed to read processedTrace.json", e);
+        }
+    }
+}package api.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.stereotype.Service;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * JBMCService spawns JBMC processes, captures their JSON output,
+ * and parses variable assignments.
+ */
+@Service
+public class JBMCService {
+
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    /**
+     * Run JBMC on a specific method signature (e.g. "SnowWhite.indexMax:([I)I")
+     * using the partial trace that was inserted in code.
+     *
+     * @param localId        The random unique ID folder (same as used by instrument/trace).
+     * @param methodSignature The fully qualified method signature for JBMC, e.g. "SnowWhite.indexMax:([I)I"
+     * @param maxUnwind      e.g. 5
+     * @param maxArrayLength e.g. 5
+     */
+    public void runJBMC(String localId,
+                        String methodSignature,
+                        int maxUnwind,
+                        int maxArrayLength) {
+
+        // 1) Identify the compiled .class or .jar location
+        //    In your structure, you presumably have "compiled" inside local_storage/<localId>/compiled
+        //    or "resources/out/instrumented" -> "resources/out/compiled" style.
+        File localFolder = new File(LOCAL_STORAGE_DIR, localId);
+        File compiledDir = new File(localFolder, "compiled");
+        if (!compiledDir.exists()) {
+            throw new RuntimeException("No compiled directory found at: " + compiledDir.getAbsolutePath());
+        }
+
+        // 2) Build the JBMC command.
+        //    In some setups, JBMC needs a class file or a method signature.
+        //    We assume the class is on the classpath within compiledDir.
+        //    We pass the method signature to JBMC in quotes: "MyClass.myMethod:()V"
+        // NOTE: You may need to tweak the classpath argument or pass the .class explicitly.
+        String jbmcPath = "jbmc"; // or "/absolute/path/to/jbmc"
+        String[] cmd = new String[] {
+                jbmcPath,
+                methodSignature,
+                "--classpath", compiledDir.getAbsolutePath(),
+                "--unwind", String.valueOf(maxUnwind),
+                "--unwinding-assertions",
+                "--disable-uncaught-exception-check",
+                "--throw-runtime-exceptions",
+                "--max-nondet-array-length", String.valueOf(maxArrayLength),
+                "--json-ui"
+        };
+
+        // 3) Spawn the JBMC process
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.directory(compiledDir);  // run from the compiled directory
+        Process process;
+        try {
+            process = pb.start();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to start JBMC process: " + e.getMessage(), e);
+        }
+
+        // 4) Capture output (JSON) from JBMC
+        StringBuilder jbmcOutput = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                jbmcOutput.append(line).append("\n");
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed reading JBMC output: " + e.getMessage(), e);
+        }
+
+        // 5) Wait for JBMC to finish
+        // 5) Wait for JBMC to finish
+        try {
+            int exitCode = process.waitFor();
+            if (exitCode != 0) {
+                // Also read error stream
+                StringBuilder errStr = new StringBuilder();
+                try (BufferedReader errBr = new BufferedReader(
+                        new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8))) {
+                    String errLine;
+                    while ((errLine = errBr.readLine()) != null) {
+                        errStr.append(errLine).append("\n");
+                    }
+                } catch (IOException e) {
+                    // Handle the IOException from reading the error stream
+                    throw new RuntimeException("Failed reading JBMC error output: " + e.getMessage(), e);
+                }
+                throw new RuntimeException("JBMC process returned exit code " + exitCode
+                        + ". Error: " + errStr);
+            }
+        } catch (InterruptedException e) {
+            throw new RuntimeException("JBMC process was interrupted: " + e.getMessage(), e);
+        }
+
+        // 6) Save raw JSON to local_storage/<localId>/jbmcOutput.json
+        File jbmcJsonFile = new File(localFolder, "jbmcOutput.json");
+        try (FileOutputStream fos = new FileOutputStream(jbmcJsonFile)) {
+            fos.write(jbmcOutput.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write JBMC JSON to file: " + e.getMessage(), e);
+        }
+
+        // 7) Optionally parse the JSON for variable values, store them in a second file
+        //    or unify with processedTrace.json. For now, let's keep it separate.
+        //    We'll do minimal parsing here. If you want a separate JBMCParser, you can call it.
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(jbmcOutput.toString());
+            // You can further process the "trace" steps to extract variable assignments, etc.
+            // For now, let's just store it. If you want extra logic, do it here.
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to parse JBMC JSON: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Return the raw JBMC JSON from local_storage/<localId>/jbmcOutput.json
+     * so the frontend can display or parse it.
+     */
+    public String getJBMCOutput(String localId) {
+        File localFolder = new File(LOCAL_STORAGE_DIR, localId);
+        File jbmcJsonFile = new File(localFolder, "jbmcOutput.json");
+        if (!jbmcJsonFile.exists()) {
+            throw new RuntimeException("No jbmcOutput.json found for ID: " + localId);
+        }
+
+        try {
+            byte[] data = java.nio.file.Files.readAllBytes(jbmcJsonFile.toPath());
+            return new String(data, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read jbmcOutput.json", e);
         }
     }
 }package api;
