@@ -59,6 +59,7 @@ public final class CompileAndRun {
 
         List<String> command = new ArrayList<>();
         command.add("javac");
+        command.add("-g");  // Add this flag to preserve debug symbols (variable names, etc.)
         command.add("-sourcepath");
         command.add(instrumentedInPath);
         command.add("-d");

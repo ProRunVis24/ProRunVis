@@ -63,7 +63,8 @@ public class JBMCService {
                 "--disable-uncaught-exception-check",
                 "--throw-runtime-exceptions",
                 "--max-nondet-array-length", String.valueOf(maxArrayLength),
-                "--json-ui"
+                "--json-ui",
+
         };
 
         System.out.println("DEBUG: about to run JBMC with command: " + String.join(" ", cmd));

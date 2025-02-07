@@ -5,6 +5,9 @@ import prorunvis.trace.process.JumpLink;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+// *** CHANGED: import for List<VarValue> ***
+import java.util.HashMap;
 
 /**
  * This class serves as Node for a type of tree, with each node containing information about which lines of code have
@@ -12,6 +15,12 @@ import java.util.List;
  * have been executed within this node.
  */
 public class TraceNode {
+
+    /**
+     * *** CHANGED: Replaced "private Map<String, String> jbmcValues;" ***
+     * Now we store a list of (iteration, value) pairs for each variable name.
+     */
+    private Map<String, List<VarValue>> jbmcValues; // *** CHANGED ***
 
     /**
      * A List containing the ranges of executed source code
@@ -61,12 +70,29 @@ public class TraceNode {
      * @param traceId The Id that maps this node to the AST
      */
     public TraceNode(final Integer parentIndex, final String traceId) {
-            this.ranges = new ArrayList<>();
-            this.childrenIndices = new ArrayList<>();
-            this.outLinks = new ArrayList<>();
-            this.parentIndex = parentIndex;
-            this.traceId = traceId;
-            this.iteration = null;
+        this.ranges = new ArrayList<>();
+        this.childrenIndices = new ArrayList<>();
+        this.outLinks = new ArrayList<>();
+        this.parentIndex = parentIndex;
+        this.traceId = traceId;
+        this.iteration = null;
+
+        // *** CHANGED: Initialize jbmcValues as an empty map. ***
+        this.jbmcValues = new HashMap<>();
+    }
+
+    /**
+     * *** CHANGED: GETTER for the new jbmcValues type. ***
+     */
+    public Map<String, List<VarValue>> getJbmcValues() {
+        return jbmcValues;
+    }
+
+    /**
+     * *** CHANGED: SETTER for the new jbmcValues type. ***
+     */
+    public void setJbmcValues(Map<String, List<VarValue>> jbmcValues) {
+        this.jbmcValues = jbmcValues;
     }
 
     /**
@@ -131,7 +157,7 @@ public class TraceNode {
      * @return The Range of code which serves as link for
      *          this node.
      */
-    public Range getLink() {
+    public JumpLink getLink() {
         return this.link;
     }
 
@@ -202,5 +228,35 @@ public class TraceNode {
      */
     public Integer getIteration() {
         return iteration;
+    }
+
+    // *** CHANGED: Introduce the VarValue helper class for (iteration, value) pairs. ***
+    // --- UPDATED VarValue Class ---
+    public static class VarValue {
+        private final String traceId;  // New field to hold the trace id.
+        private final int iteration;
+        private final String value;
+
+        public VarValue(String traceId, int iteration, String value) {
+            this.traceId = traceId;
+            this.iteration = iteration;
+            this.value = value;
+        }
+
+        public String getTraceId() {
+            return traceId;
+        }
+
+        public int getIteration() {
+            return iteration;
+        }
+
+        public String getValue() {
+            return value;
+        }
+        @Override
+        public String toString() {
+            return "{\"traceId\": \"" + traceId + "\", \"iteration\": " + iteration + ", \"value\": \"" + value + "\"}";
+        }
     }
 }
