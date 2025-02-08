@@ -70,8 +70,17 @@ public final class Instrumenter {
                 "import java.io.BufferedWriter;\n" +
                 "import java.io.FileWriter;\n" +
                 "import java.io.IOException;\n" +
+                "\n" +
                 "public final class Trace {\n" +
+                "    // These fields allow manual forcing of a trace\n" +
+                "    public static int[] trace = null;\n" +
+                "    public static int index = 0;\n" +
+                "\n" +
                 "    public static void next_elem(int num) {\n" +
+                "        if (trace != null && index < trace.length) {\n" +
+                "            num = trace[index];\n" +
+                "            index++;\n" +
+                "        }\n" +
                 "        try (BufferedWriter writer = new BufferedWriter(new FileWriter(\"Trace.tr\", true))) {\n" +
                 "            writer.write(\"\" + num + System.lineSeparator());\n" +
                 "        } catch (IOException e) {\n" +

@@ -123,7 +123,7 @@ public final class ProRunVis {
                 //save json trace to file
                 File jsonTrace = new File(outputPath + "/Trace.json");
                 try (BufferedWriter writer = new BufferedWriter(new FileWriter(jsonTrace))) {
-                    Gson gson = new GsonBuilder().setPrettyPrinting().create();
+                    Gson gson = new GsonBuilder().serializeNulls().setPrettyPrinting().create();
                     writer.write(gson.toJson(processor.getNodeList()));
                 }
             } catch (IOException | InterruptedException e) {

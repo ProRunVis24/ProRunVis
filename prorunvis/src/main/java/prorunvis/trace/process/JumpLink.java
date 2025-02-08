@@ -31,7 +31,16 @@ public class JumpLink extends Range {
      *
      * @return A String representing start, end and target of this JumpLink.
      */
+    @Override
     public String toString() {
         return "(" + super.toString() + "," + this.filepath + ")";
+    }
+    /**
+     * Getter for the filepath.
+     *
+     * @return the relative file path as a String.
+     */
+    public String getFilepath() {
+        return this.filepath;
     }
 }
