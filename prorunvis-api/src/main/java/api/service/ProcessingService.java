@@ -20,8 +20,12 @@ import java.util.*;
 public class ProcessingService {
 
     private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+    // NEW: keep the last processed node list in memory
+    private List<TraceNode> lastProcessedNodes;
 
     public void processTrace(String traceId) {
+
+
         System.out.println("[processTrace] Starting process for traceId = " + traceId);
 
         // 1) local_storage/<traceId> must exist
@@ -48,10 +52,11 @@ public class ProcessingService {
             // Preprocess & Instrument
             prorunvis.preprocess.Preprocessor.run(cu);
             prorunvis.instrument.Instrumenter.run(cu, map);
-        }
-
+        }// store in memory
         // 5) Construct the TraceProcessor
         TraceProcessor processor = new TraceProcessor(map, traceFile.getAbsolutePath(), codeRoot);
+        List<TraceNode> nodeList = processor.getNodeList();
+        this.lastProcessedNodes = nodeList;
         try {
             processor.start();
         } catch (Exception e) {
@@ -59,7 +64,7 @@ public class ProcessingService {
         }
 
         // 6) Final trace nodes
-        List<TraceNode> nodeList = processor.getNodeList();
+
         System.out.println("[processTrace] Found " + nodeList.size() + " trace nodes.");
 
         // 7) Merge JBMC data (including bridging variable names)
@@ -74,6 +79,14 @@ public class ProcessingService {
             throw new RuntimeException("Failed to write processedTrace.json at: " + outputJson.getAbsolutePath(), e);
         }
         System.out.println("[processTrace] Completed. JSON at: " + outputJson.getAbsolutePath());
+    }
+    /**
+     * Returns the in-memory list of TraceNodes from the last processing step.
+     * If no processing has occurred, or if you want to track them *by traceId*,
+     * you can store a Map<String,List<TraceNode>> instead.
+     */
+    public List<TraceNode> getLastProcessedNodes() {
+        return this.lastProcessedNodes;
     }
 
     /**

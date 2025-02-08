@@ -63,6 +63,8 @@ public class TraceNode {
      * The ID that maps the Node to an ASTNode.
      */
     private String traceId;
+    private String nodeMethodName;        // e.g. "myMethod"
+    private String nodeMethodSignature;   // e.g. "MyClass.myMethod:([I)I"
 
     /**
      * Constructs a {@link TraceNode} object.
@@ -81,6 +83,21 @@ public class TraceNode {
         this.jbmcValues = new HashMap<>();
     }
 
+    public String getNodeMethodName() {
+        return nodeMethodName;
+    }
+
+    public void setNodeMethodName(String nodeMethodName) {
+        this.nodeMethodName = nodeMethodName;
+    }
+
+    public String getNodeMethodSignature() {
+        return nodeMethodSignature;
+    }
+
+    public void setNodeMethodSignature(String nodeMethodSignature) {
+        this.nodeMethodSignature = nodeMethodSignature;
+    }
     /**
      * *** CHANGED: GETTER for the new jbmcValues type. ***
      */

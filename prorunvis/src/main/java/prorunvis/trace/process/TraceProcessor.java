@@ -101,6 +101,48 @@ public class TraceProcessor {
         this.rootDir = rootDir.toAbsolutePath();
     }
 
+    // -------------- Add this near the top of TraceProcessor (or as a private static method) --------------
+    private static String toJvmDescriptor(com.github.javaparser.ast.type.Type type) {
+        // For arrays, primitives, reference types, or void.
+        if (type.isArrayType()) {
+            // e.g. int[] => "[I"
+            // so we do "[" plus the component type
+            return "[" + toJvmDescriptor(type.asArrayType().getComponentType());
+        }
+        if (type.isPrimitiveType()) {
+            switch (type.asPrimitiveType().asString()) {
+                case "boolean": return "Z";
+                case "byte":    return "B";
+                case "char":    return "C";
+                case "short":   return "S";
+                case "int":     return "I";
+                case "long":    return "J";
+                case "float":   return "F";
+                case "double":  return "D";
+            }
+        }
+        if (type.isVoidType()) {
+            return "V";
+        }
+
+        // Otherwise, must be a Class/Interface type.
+        // We'll do "Lfully/qualified/ClassName;"
+        // e.g. "java.lang.String" => "Ljava/lang/String;"
+        // (Here we rely on type.asString() => "String" or "java.util.List", etc.)
+        String rawName = type.asString();
+        // if it's something like "String", we can’t know the package unless we do more resolution.
+        // But to keep it simple, let's assume the type is "java.lang.String" or the short name.
+        // We'll replace '.' or generics with '/', then wrap in L...;
+
+        // remove generics <...>, if any:
+        rawName = rawName.replaceAll("<.*>", "");
+        // replace '.' with '/' (if user wrote fully qualified types)
+        rawName = rawName.replace('.', '/');
+        // also replace package if we can’t find it, you might do partial.
+        // Minimal approach: just do "L" + rawName + ";"
+        return "L" + rawName.replaceAll("\\.", "/") + ";";
+    }
+
     /**
      * Start the processor by creating the token stack and
      * the root for the tree.
@@ -181,6 +223,18 @@ public class TraceProcessor {
 
         return false;
     }
+    private String extractClassName(MethodDeclaration md) {
+        // Get the file name from the compilation unit’s storage.
+        String fileName = md.findCompilationUnit()
+                .flatMap(cu -> cu.getStorage())
+                .map(storage -> storage.getFileName())
+                .orElse("UnknownClass");
+        // Remove the ".java" suffix if present
+        if (fileName.endsWith(".java")) {
+            return fileName.substring(0, fileName.length() - 5);
+        }
+        return fileName;
+    }
 
     /**
      * Creates a new TraceNode, which will be added as child to current.
@@ -203,6 +257,36 @@ public class TraceProcessor {
         Node tempNodeOfCurrent = nodeOfCurrent;
         List<Range> tempRanges = methodCallRanges;
         nodeOfCurrent = traceMap.get(tokenValue);
+
+        // 1) If this is a method node, fill in methodName + signature
+        if (nodeOfCurrent instanceof MethodDeclaration md) {
+            // --- the simple method name, e.g. "main", "doSomething" ---
+            traceNode.setNodeMethodName(md.getNameAsString());
+
+            // We'll try to form "packageName.ClassName" from the compilation unit:
+            //   e.g. "my.pkg" + "." + "SnowWhite"
+            // or fallback "SnowWhite" if no package
+            // or fallback "UnknownClass" if we cannot find anything
+            String fullyQualifiedClass = extractClassName(md);
+
+            // 2) Build the JVM descriptor for param types + return
+            StringBuilder paramBuf = new StringBuilder("(");
+            md.getParameters().forEach(p -> {
+                paramBuf.append(toJvmDescriptor(p.getType()));
+            });
+            paramBuf.append(")");
+            String returnDesc = toJvmDescriptor(md.getType());
+
+            // 3) Combine => "my.pkg.SnowWhite.methodName:([I)I"
+            String signature = fullyQualifiedClass
+                    + "."
+                    + md.getNameAsString()
+                    + ":"
+                    + paramBuf.toString()
+                    + returnDesc;
+
+            traceNode.setNodeMethodSignature(signature);
+        }
         methodCallRanges = new ArrayList<>();
 
         fillRanges((getBlockStmt() == null)
