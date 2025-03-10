@@ -13,7 +13,7 @@ public class JBMCParser {
         public final String value;
         public final String file;
         public final int line;
-        public final int iteration;  // New field to store the iteration (if provided)
+        public final int iteration;
 
         public VarAssignment(String variableName, String value, String file, int line, int iteration) {
             this.variableName = variableName;
@@ -57,20 +57,28 @@ public class JBMCParser {
                                     if (traceArray.isArray()) {
                                         // Iterate over each step in the trace.
                                         for (JsonNode traceStep : traceArray) {
-                                            // Process all steps that have a stepType "assignment"
+                                            // Process all steps with a stepType of "assignment"
                                             if (traceStep.has("stepType") &&
                                                     "assignment".equals(traceStep.get("stepType").asText())) {
-                                                String lhs = traceStep.has("lhs") ? traceStep.get("lhs").asText() : "unknown";
+                                                // Prefer "variableName" if it exists, otherwise use "lhs"
+                                                String variableName = "unknown";
+                                                if (traceStep.has("variableName")) {
+                                                    variableName = traceStep.get("variableName").asText();
+                                                } else if (traceStep.has("lhs")) {
+                                                    variableName = traceStep.get("lhs").asText();
+                                                }
+
+                                                // Extract the value; if "value" is an object with a "data" key, use that.
                                                 String value = "";
                                                 if (traceStep.has("value")) {
                                                     JsonNode valueNode = traceStep.get("value");
-                                                    // If the value is an object and contains a "data" key, use that.
                                                     if (valueNode.isObject() && valueNode.has("data")) {
                                                         value = valueNode.get("data").asText();
                                                     } else {
                                                         value = valueNode.asText();
                                                     }
                                                 }
+
                                                 // Extract sourceLocation details.
                                                 String file = "unknown";
                                                 int line = -1;
@@ -83,12 +91,14 @@ public class JBMCParser {
                                                         line = sourceLoc.get("line").asInt(-1);
                                                     }
                                                 }
+
                                                 // Extract iteration information if present; default to -1 if not.
                                                 int iteration = -1;
                                                 if (traceStep.has("iteration")) {
                                                     iteration = traceStep.get("iteration").asInt(-1);
                                                 }
-                                                assignments.add(new VarAssignment(lhs, value, file, line, iteration));
+
+                                                assignments.add(new VarAssignment(variableName, value, file, line, iteration));
                                             }
                                         }
                                     }
