@@ -16,60 +16,60 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * A reworked InstrumentationService that does NOT store data in a DB.
- * Instead, it stores the instrumented code locally, keyed by a random ID.
+ * A reworked InstrumentationService that stores instrumented code in session-specific locations
  */
 @Service
 public class InstrumentationService {
 
     /**
      * The base folder where we store each run's local data,
-     * keyed by a random ID (e.g. "resources/local_storage/<ID>").
+     * keyed by a session ID and random instrument ID.
      */
     private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
 
     public InstrumentationService() {
-        // No repository injection needed anymore.
+        // No repository injection needed
     }
 
     /**
-     * Creates/cleans "resources/out" so the instrumentation can run
-     * from a clean slate. This is the same logic you had before.
+     * Creates/cleans session-specific output directories
      */
-    private void ensureCleanOutputDirectories() {
-        File outDir = new File("resources/out");
+    private void ensureCleanOutputDirectories(String sessionId) {
+        File outDir = new File("resources/out/session-" + sessionId);
         if (outDir.exists()) {
-            System.out.println("Cleaning existing resources/out directory...");
+            System.out.println("Cleaning existing resources/out/session-" + sessionId + " directory...");
             try {
                 Files.walk(outDir.toPath())
                         .map(java.nio.file.Path::toFile)
                         .sorted((o1, o2) -> -o1.compareTo(o2)) // delete children first
                         .forEach(File::delete);
             } catch (IOException e) {
-                throw new RuntimeException("Failed to clean output directories", e);
+                throw new RuntimeException("Failed to clean output directories for session: " + sessionId, e);
             }
         }
         if (!outDir.mkdirs()) {
-            throw new RuntimeException("Failed to create output directory at resources/out.");
+            throw new RuntimeException("Failed to create output directory for session: " + sessionId);
         }
 
-        File instrDir = new File("resources/out/instrumented");
+        File instrDir = new File(outDir, "instrumented");
         if (!instrDir.exists() && !instrDir.mkdirs()) {
-            throw new RuntimeException("Failed to create instrumented directory at resources/out/instrumented.");
+            throw new RuntimeException("Failed to create instrumented directory for session: " + sessionId);
         }
     }
 
     /**
-     * Instruments the code and stores results in "resources/local_storage/<randomId>/".
+     * Instruments the code and stores results in session-specific locations
      *
      * @param projectName   the name of the user's project
      * @param inputDirPath  the folder containing the source code to be instrumented
-     * @param randomId      a unique ID that we can use for storing output
-     * @return Some success message (or path).
+     * @param randomId      a unique ID for this instrumentation job
+     * @param sessionId     the session identifier
+     * @return Some success message (or path)
      */
     public String instrumentProject(String projectName,
                                     String inputDirPath,
-                                    String randomId) {
+                                    String randomId,
+                                    String sessionId) {
 
         // 1) Verify input directory is valid
         File inputDir = new File(inputDirPath);
@@ -77,18 +77,17 @@ public class InstrumentationService {
             throw new RuntimeException("Input directory does not exist or is not a directory: " + inputDirPath);
         }
 
-
-        // 2) Clean & set up "resources/out"
-        ensureCleanOutputDirectories();
+        // 2) Clean & set up session-specific output directory
+        ensureCleanOutputDirectories(sessionId);
 
         // 3) Parse & instrument code
-        System.out.println("Parsing project at: " + inputDirPath);
+        System.out.println("Parsing project at: " + inputDirPath + " for session: " + sessionId);
         ProjectRoot projectRoot = Util.parseProject(inputDir);
         List<CompilationUnit> cus = Util.getCUs(projectRoot);
         if (cus.isEmpty()) {
             throw new RuntimeException("No Java files found in: " + inputDirPath);
         }
-        System.out.println("Found " + cus.size() + " compilation units.");
+        System.out.println("Found " + cus.size() + " compilation units for session: " + sessionId);
 
         Map<Integer, Node> map = new HashMap<>();
         for (CompilationUnit cu : cus) {
@@ -96,31 +95,37 @@ public class InstrumentationService {
             Instrumenter.run(cu, map);
         }
 
+        // 4) Save instrumented code to the session directory
+        String sessionInstrDir = "resources/out/session-" + sessionId + "/instrumented";
+        Instrumenter.saveInstrumented(projectRoot, sessionInstrDir);
 
-        // 5) Save instrumented code
-        Instrumenter.saveInstrumented(projectRoot, "resources/out/instrumented");
-
-        // 6) Check that something was indeed saved
-        File instrDir = new File("resources/out/instrumented");
+        // 5) Check that something was indeed saved
+        File instrDir = new File(sessionInstrDir);
         String[] instrumentedFiles = instrDir.list();
         if (instrumentedFiles == null || instrumentedFiles.length == 0) {
-            throw new RuntimeException("No files found in instrumented directory after saving instrumented code.");
+            throw new RuntimeException("No files found in instrumented directory after saving instrumented code for session: " + sessionId);
         }
-        System.out.println("Files in instrumented directory:");
+        System.out.println("Files in instrumented directory for session: " + sessionId);
         for (String f : instrumentedFiles) {
             System.out.println(" - " + f);
         }
 
-        // 7) Zip & encode
-        System.out.println("Zipping instrumented code...");
-        String zipBase64 = Util.zipAndEncode(projectRoot);
+        // 6) Zip & encode
+        System.out.println("Zipping instrumented code for session: " + sessionId);
+        String zipBase64 = Util.zipAndEncode(projectRoot, sessionId);
         if (zipBase64 == null || zipBase64.isEmpty()) {
-            throw new RuntimeException("Failed to zip instrumented code.");
+            throw new RuntimeException("Failed to zip instrumented code for session: " + sessionId);
         }
 
-        // 8) Store the resulting Base64 in "resources/local_storage/<randomId>/instrumented.txt"
-        // Make a local folder for this randomId
-        File randomIdFolder = new File(LOCAL_STORAGE_DIR, randomId);
+        // 7) Create session-specific folder structure
+        String sessionBaseDir = LOCAL_STORAGE_DIR + "/session-" + sessionId;
+        File sessionBaseDirFile = new File(sessionBaseDir);
+        if (!sessionBaseDirFile.exists()) {
+            sessionBaseDirFile.mkdirs();
+        }
+
+        // 8) Store in session-specific location
+        File randomIdFolder = new File(sessionBaseDir, randomId);
         if (!randomIdFolder.exists()) {
             randomIdFolder.mkdirs();
         }
@@ -128,13 +133,17 @@ public class InstrumentationService {
         try (FileOutputStream fos = new FileOutputStream(outputFile)) {
             fos.write(zipBase64.getBytes());
         } catch (IOException e) {
-            throw new RuntimeException("Error writing local instrumented file: " + e.getMessage(), e);
+            throw new RuntimeException("Error writing instrumented file for session: " + sessionId, e);
         }
 
-        System.out.println("Instrumented code stored locally in: " + outputFile.getAbsolutePath());
+        System.out.println("Instrumented code stored locally in: " + outputFile.getAbsolutePath() + " for session: " + sessionId);
 
         // Return a success message
-        return "Instrumented code saved under ID=" + randomId
-                + " at: " + outputFile.getAbsolutePath();
+        return "Instrumented code saved under ID=" + randomId + " for session=" + sessionId;
+    }
+
+    // For backward compatibility
+    public String instrumentProject(String projectName, String inputDirPath, String randomId) {
+        return instrumentProject(projectName, inputDirPath, randomId, "default");
     }
 }

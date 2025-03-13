@@ -39,22 +39,29 @@ public class Util {
                 .collect(Collectors.toList());
     }
 
-    public static String zipAndEncode(ProjectRoot projectRoot) {
-        // This zips the instrumented code output (assuming saved in "resources/out/instrumented")
-        File instrumentedDir = new File("resources/out/instrumented");
+    public static String zipAndEncode(ProjectRoot projectRoot, String sessionId) {
+        // This zips the instrumented code output for a specific session
+        File instrumentedDir = new File("resources/out/session-" + sessionId + "/instrumented");
         if (!instrumentedDir.exists()) {
-            throw new RuntimeException("Instrumented directory not found.");
+            throw new RuntimeException("Instrumented directory not found for session: " + sessionId);
         }
 
-        File zipFile = new File("instrumented.zip");
+        File zipFile = new File("instrumented-session-" + sessionId + ".zip");
         zipDirectory(instrumentedDir, zipFile);
         byte[] content;
         try {
             content = Files.readAllBytes(zipFile.toPath());
+            // Clean up the zip file after reading it
+            Files.deleteIfExists(zipFile.toPath());
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
         return Base64.getEncoder().encodeToString(content);
+    }
+
+    // For backward compatibility
+    public static String zipAndEncode(ProjectRoot projectRoot) {
+        return zipAndEncode(projectRoot, "default");
     }
 
     public static void zipDirectory(File sourceDir, File zipFile) {
@@ -78,17 +85,20 @@ public class Util {
         }
     }
 
-    public static File unzipAndDecode(String base64Zip) {
+    public static File unzipAndDecode(String base64Zip, String sessionOutDir) {
         // For simplicity, we'll just write out the zip and manually extract it
         byte[] data = Base64.getDecoder().decode(base64Zip);
-        File zipFile = new File("instrumented_downloaded.zip");
+
+        File zipFile = new File(sessionOutDir, "instrumented_downloaded.zip");
         try {
+            // Create parent directory if it doesn't exist
+            zipFile.getParentFile().mkdirs();
             Files.write(zipFile.toPath(), data);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
 
-        File outputDir = new File("resources/out/downloaded_instrumented");
+        File outputDir = new File(sessionOutDir, "downloaded_instrumented");
         if (!outputDir.exists()) {
             outputDir.mkdirs();
         }
@@ -102,11 +112,18 @@ public class Util {
                     zis.transferTo(fos);
                 }
             }
+            // Clean up the zip file after extraction
+            Files.deleteIfExists(zipFile.toPath());
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
 
         return outputDir;
+    }
+
+    // For backward compatibility
+    public static File unzipAndDecode(String base64Zip) {
+        return unzipAndDecode(base64Zip, "resources/out");
     }
 
     public static List<CompilationUnit> loadCUs(File instrumentedDir) {
@@ -122,13 +139,22 @@ public class Util {
         }
     }
 
-    public static File createTempTraceFile(String content) {
+    public static File createTempTraceFile(String content, String sessionId) {
         try {
-            File f = File.createTempFile("trace", ".tr");
+            File sessionDir = new File("resources/out/session-" + sessionId);
+            if (!sessionDir.exists()) {
+                sessionDir.mkdirs();
+            }
+            File f = File.createTempFile("trace-session-" + sessionId + "-", ".tr", sessionDir);
             Files.write(f.toPath(), content.getBytes(StandardCharsets.UTF_8));
             return f;
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    // For backward compatibility
+    public static File createTempTraceFile(String content) {
+        return createTempTraceFile(content, "default");
     }
 }

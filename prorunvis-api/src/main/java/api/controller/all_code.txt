@@ -1,0 +1,422 @@
+===== ./JBMCController.java =====
+package api.controller;
+
+import api.service.JBMCService;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
+@RestController
+@RequestMapping("/api/jbmc")
+public class JBMCController {
+
+    private final JBMCService jbmcService;
+
+    public JBMCController(JBMCService jbmcService) {
+        this.jbmcService = jbmcService;
+    }
+
+    /**
+     * POST /api/jbmc/run?instrumentId=<localId>&methodSignature=<sig>&unwind=5&maxArray=5
+     * This triggers JBMC to run for that localId's compiled code.
+     */
+    @PostMapping("/run")
+    public ResponseEntity<String> runJBMC(@RequestParam("instrumentId") String instrumentId,
+                                          @RequestParam("methodSignature") String methodSignature,
+                                          @RequestParam(name = "unwind", defaultValue = "5") int unwind,
+                                          @RequestParam(name = "maxArray", defaultValue = "5") int maxArray,
+                                          HttpServletRequest request) {
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            return ResponseEntity.badRequest().body("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        jbmcService.runJBMC(instrumentId, methodSignature, unwind, maxArray, sessionId);
+        return ResponseEntity.ok("JBMC run complete. JSON stored in local_storage/session-" + sessionId + "/" + instrumentId + "/jbmcOutput.json");
+    }
+
+    /**
+     * GET /api/jbmc/result/<instrumentId>
+     * Returns the raw JSON from JBMC's last run for that localId.
+     */
+    @GetMapping(value = "/result/{instrumentId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<String> getJBMCResult(@PathVariable String instrumentId,
+                                                HttpServletRequest request) {
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            return ResponseEntity.badRequest().body("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        String jbmcJson = jbmcService.getJBMCOutput(instrumentId, sessionId);
+        return ResponseEntity.ok(jbmcJson);
+    }
+}===== ./VisualizationController.java =====
+package api.controller;
+
+import api.service.VisualizationService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
+/**
+ * Returns JSON from the processedTrace.json file in local_storage/session-<sessionId>/<localId>.
+ */
+@RestController
+@RequestMapping("/api/visualize")
+public class VisualizationController {
+
+    private final VisualizationService service;
+    private final ObjectMapper objectMapper;
+
+    public VisualizationController(VisualizationService service) {
+        this.service = service;
+        this.objectMapper = new ObjectMapper();
+    }
+
+    /**
+     * We pass a local ID referencing the folder with processedTrace.json.
+     *
+     * 1) We read the raw JSON string from VisualizationService.
+     * 2) Parse it into an Object so Spring can produce real JSON with correct Content-Type.
+     */
+    @GetMapping(value = "/{localId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<Object> getTraceJson(@PathVariable String localId,
+                                               HttpServletRequest request) {
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            return ResponseEntity.badRequest().body("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        String rawJson = service.getTraceJson(localId, sessionId);
+        try {
+            // Convert the raw JSON string to a generic Object
+            Object jsonObj = objectMapper.readValue(rawJson, Object.class);
+            // Return as JSON, 200 OK
+            return ResponseEntity.ok(jsonObj);
+        } catch (Exception e) {
+            // If parse fails or file is invalid, return 500
+            return ResponseEntity
+                    .status(500)
+                    .body("Failed to parse processedTrace.json: " + e.getMessage());
+        }
+    }
+}===== ./TraceController.java =====
+package api.controller;
+
+import api.service.TracingService;
+import org.springframework.web.bind.annotation.*;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
+@RestController
+@RequestMapping("/api/trace")
+public class TraceController {
+
+    private final TracingService service;
+
+    public TraceController(TracingService service) {
+        this.service = service;
+    }
+
+    /**
+     * The client calls: POST /api/trace?instrumentId=<shortId>
+     * We do NOT return a big absolute path anymore.
+     * Instead, we just return the same short ID so the user can
+     * pass it to /api/process later.
+     */
+    @PostMapping
+    public String runTrace(
+            @RequestParam String instrumentId,
+            HttpServletRequest request) {
+
+        // Get session ID from the request
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            throw new RuntimeException("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        // Run the trace with both instrumentId and sessionId
+        service.runTrace(instrumentId, sessionId);
+
+        // Return the instrument ID for the next step
+        return instrumentId;
+    }
+}===== ./VarMappingController.java =====
+package api.controller;
+
+import api.service.VariableNameMapper;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
+@RestController
+@RequestMapping("/api/varMapping")
+public class VarMappingController {
+
+    /**
+     * Given a file name and line number, returns a list of variable names
+     * declared on that line. For example, if the file "MyClass.java" has two
+     * variables declared on line 15, this endpoint returns them.
+     *
+     * URL example: GET /api/varMapping?file=MyClass.java&line=15
+     */
+    @GetMapping
+    public ResponseEntity<List<String>> getVariables(
+            @RequestParam String file,
+            @RequestParam int line,
+            HttpServletRequest request) {
+
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            return ResponseEntity.badRequest()
+                    .body(Collections.emptyList());
+        }
+        String sessionId = session.getId();
+
+        VariableNameMapper mapper = new VariableNameMapper();
+        try {
+            // Build the mapping from the session-specific source directory
+            mapper.buildVarNameMapping(Paths.get("resources/in/session-" + sessionId));
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Collections.emptyList());
+        }
+
+        Map<String, Map<Integer, List<String>>> varDeclMap = mapper.getVarDeclMap();
+        // Extract only the simple file name
+        String simpleFile = new File(file).getName();
+        Map<Integer, List<String>> fileMapping = varDeclMap.get(simpleFile);
+        List<String> variables = (fileMapping != null) ? fileMapping.get(line) : null;
+        if (variables == null) {
+            variables = Collections.emptyList();
+        }
+        return ResponseEntity.ok(variables);
+    }
+}===== ./ProcessController.java =====
+package api.controller;
+
+import api.service.ProcessingService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
+@RestController
+@RequestMapping("/api/process")
+public class ProcessController {
+
+    private final ProcessingService processingService;
+
+    public ProcessController(ProcessingService processingService) {
+        this.processingService = processingService;
+    }
+
+    /**
+     * POST /api/process?traceId=<shortId>
+     *
+     * We'll read local_storage/session-<sessionId>/<shortId>/Trace.tr,
+     * produce processedTrace.json, store it in the same folder,
+     * and return the shortId (or path) for the next step.
+     */
+    @PostMapping
+    public String processTrace(@RequestParam String traceId,
+                               HttpServletRequest request) {
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            throw new RuntimeException("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        // run the processing with session ID
+        processingService.processTrace(traceId, sessionId);
+
+        // return the same short ID for the front end
+        // so the front end can do a GET /api/visualize/<traceId> if desired
+        return traceId;
+    }
+}===== ./InstrumentController.java =====
+package api.controller;
+
+import api.service.InstrumentationService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/instrument")
+public class InstrumentController {
+    private final InstrumentationService service;
+
+    public InstrumentController(InstrumentationService service) {
+        this.service = service;
+    }
+
+    /**
+     * Returns a String ID referencing a local folder
+     * Adds session ID awareness
+     */
+    @PostMapping
+    public String instrumentProject(
+            @RequestParam String projectName,
+            @RequestParam(required = false) String inputDir,
+            HttpServletRequest request
+    ) {
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            throw new RuntimeException("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        // If inputDir not provided, use session-specific default
+        if (inputDir == null || inputDir.isEmpty()) {
+            inputDir = "resources/in/session-" + sessionId;
+        }
+
+        // Generate a unique ID for this instrumentation job
+        String randomId = UUID.randomUUID().toString();
+
+        // Instrument the code with session awareness
+        service.instrumentProject(projectName, inputDir, randomId, sessionId);
+
+        // Return that ID so the frontend can pass it to subsequent endpoints
+        return randomId;
+    }
+}===== ./StaticMethodController.java =====
+package api.controller;
+
+import api.functionality.StaticMethodExtractorService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
+@RestController
+public class StaticMethodController {
+
+    private final StaticMethodExtractorService extractorService;
+
+    @Autowired
+    public StaticMethodController(StaticMethodExtractorService extractorService) {
+        this.extractorService = extractorService;
+    }
+
+    // Expose an endpoint that returns the static methods JSON
+    @GetMapping("/api/static-methods")
+    public String getStaticMethods(HttpServletRequest request) {
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            throw new RuntimeException("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        return extractorService.toJSON(sessionId);
+    }
+}===== ./JBMCFlattenController.java =====
+package api.controller;
+
+import api.service.JBMCFlattenService;
+import api.service.ProcessingService;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+import java.util.logging.Logger;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
+@RestController
+@RequestMapping("/api/jbmc/flatten")
+public class JBMCFlattenController {
+
+    private static final Logger logger = Logger.getLogger(JBMCFlattenController.class.getName());
+
+    private final ProcessingService processingService;
+    private final JBMCFlattenService flattenService;
+
+    public JBMCFlattenController(ProcessingService processingService,
+                                 JBMCFlattenService flattenService) {
+        this.processingService = processingService;
+        this.flattenService = flattenService;
+    }
+
+    /**
+     * GET /api/jbmc/flatten
+     * Returns an array of FlattenedAssignment objects in JSON.
+     */
+    @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> getFlattenedAssignments(HttpServletRequest request) {
+        logger.info("Received request for flattened JBMC assignments.");
+
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            logger.warning("No active session found.");
+            return ResponseEntity.badRequest().body("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        // 1) Grab the last processed nodes from memory for this session
+        var nodeList = processingService.getLastProcessedNodes(sessionId);
+        if (nodeList == null || nodeList.isEmpty()) {
+            logger.warning("No in-memory trace data found for session: " + sessionId + ". Did you run /api/process yet?");
+            return ResponseEntity.badRequest().body("No in-memory trace data found. Did you run /api/process yet?");
+        }
+        logger.info("Retrieved " + nodeList.size() + " processed trace nodes from memory for session: " + sessionId);
+
+        // 2) Flatten them
+        List<JBMCFlattenService.FlattenedAssignment> flattened;
+        try {
+            flattened = flattenService.flatten(nodeList);
+            logger.info("Successfully flattened assignments. Total flattened assignments: " + flattened.size());
+        } catch (Exception e) {
+            logger.severe("Error flattening JBMC assignments: " + e.getMessage());
+            return ResponseEntity.status(500).body("Error flattening JBMC assignments: " + e.getMessage());
+        }
+
+        // 3) Return as JSON
+        logger.info("Returning flattened JBMC assignments as JSON for session: " + sessionId);
+        return ResponseEntity.ok(flattened);
+    }
+}

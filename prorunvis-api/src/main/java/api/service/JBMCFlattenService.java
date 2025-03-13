@@ -12,17 +12,10 @@ public class JBMCFlattenService {
 
     private static final Logger logger = Logger.getLogger(JBMCFlattenService.class.getName());
 
-    /**
-     * Flattens the given list of TraceNodes into a list of FlattenedAssignment objects.
-     *
-     * @param nodeList the list of TraceNodes to flatten
-     * @return a list of FlattenedAssignment objects
-     */
     public List<FlattenedAssignment> flatten(List<TraceNode> nodeList) {
         logger.info("Starting flattening of " + nodeList.size() + " trace nodes.");
         List<FlattenedAssignment> assignments = new ArrayList<>();
         try {
-            // Example logic (adjust according to your actual flattening code):
             for (TraceNode node : nodeList) {
                 if (node.getJbmcValues() != null) {
                     node.getJbmcValues().forEach((varName, varValues) -> {
@@ -40,9 +33,6 @@ public class JBMCFlattenService {
         return assignments;
     }
 
-    /**
-     * Inner class to represent a flattened JBMC variable assignment.
-     */
     public static class FlattenedAssignment {
         private String nodeTraceId;
         private String variableName;
@@ -55,8 +45,6 @@ public class JBMCFlattenService {
             this.iteration = iteration;
             this.value = value;
         }
-
-        // Getters and setters...
 
         public String getNodeTraceId() {
             return nodeTraceId;
