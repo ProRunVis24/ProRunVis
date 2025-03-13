@@ -9,8 +9,11 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
 /**
- * Returns JSON from the processedTrace.json file in local_storage/<localId>.
+ * Returns JSON from the processedTrace.json file in local_storage/session-<sessionId>/<localId>.
  */
 @RestController
 @RequestMapping("/api/visualize")
@@ -31,8 +34,16 @@ public class VisualizationController {
      * 2) Parse it into an Object so Spring can produce real JSON with correct Content-Type.
      */
     @GetMapping(value = "/{localId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<Object> getTraceJson(@PathVariable String localId) {
-        String rawJson = service.getTraceJson(localId);
+    public ResponseEntity<Object> getTraceJson(@PathVariable String localId,
+                                               HttpServletRequest request) {
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            return ResponseEntity.badRequest().body("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        String rawJson = service.getTraceJson(localId, sessionId);
         try {
             // Convert the raw JSON string to a generic Object
             Object jsonObj = objectMapper.readValue(rawJson, Object.class);

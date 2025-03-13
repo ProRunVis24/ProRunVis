@@ -8,6 +8,9 @@ import org.springframework.web.bind.annotation.*;
 import java.util.List;
 import java.util.logging.Logger;
 
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
 @RestController
 @RequestMapping("/api/jbmc/flatten")
 public class JBMCFlattenController {
@@ -28,16 +31,24 @@ public class JBMCFlattenController {
      * Returns an array of FlattenedAssignment objects in JSON.
      */
     @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<?> getFlattenedAssignments() {
+    public ResponseEntity<?> getFlattenedAssignments(HttpServletRequest request) {
         logger.info("Received request for flattened JBMC assignments.");
 
-        // 1) Grab the last processed nodes from memory
-        var nodeList = processingService.getLastProcessedNodes();
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            logger.warning("No active session found.");
+            return ResponseEntity.badRequest().body("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        // 1) Grab the last processed nodes from memory for this session
+        var nodeList = processingService.getLastProcessedNodes(sessionId);
         if (nodeList == null || nodeList.isEmpty()) {
-            logger.warning("No in-memory trace data found. Did you run /api/process yet?");
+            logger.warning("No in-memory trace data found for session: " + sessionId + ". Did you run /api/process yet?");
             return ResponseEntity.badRequest().body("No in-memory trace data found. Did you run /api/process yet?");
         }
-        logger.info("Retrieved " + nodeList.size() + " processed trace nodes from memory.");
+        logger.info("Retrieved " + nodeList.size() + " processed trace nodes from memory for session: " + sessionId);
 
         // 2) Flatten them
         List<JBMCFlattenService.FlattenedAssignment> flattened;
@@ -50,7 +61,7 @@ public class JBMCFlattenController {
         }
 
         // 3) Return as JSON
-        logger.info("Returning flattened JBMC assignments as JSON.");
+        logger.info("Returning flattened JBMC assignments as JSON for session: " + sessionId);
         return ResponseEntity.ok(flattened);
     }
 }

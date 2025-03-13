@@ -10,6 +10,7 @@ import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import api.upload.storage.StorageProperties;
+import api.upload.storage.StorageService;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
@@ -21,14 +22,23 @@ import java.util.List;
 @Service
 public class StaticMethodExtractorService {
 
-    private final File sourceDir;
+    private final StorageService storageService;
 
-    public StaticMethodExtractorService(StorageProperties properties) {
-        // Uses the "in" location from your storage properties
-        this.sourceDir = Paths.get(properties.getLocation()).toFile();
+    public StaticMethodExtractorService(StorageService storageService) {
+        this.storageService = storageService;
     }
 
-    public List<MethodInfo> extractMethods() {
+    public List<MethodInfo> extractMethods(String sessionId) {
+        // Use the session-specific input location
+        String sourceLocation = storageService.getSessionInLocation(sessionId);
+        File sourceDir = new File(sourceLocation);
+
+        if (!sourceDir.exists()) {
+            System.out.println("Source directory does not exist for session: " + sessionId +
+                    " at: " + sourceLocation);
+            return new ArrayList<>();
+        }
+
         // Configure JavaParser to use a symbol solver
         StaticJavaParser.getParserConfiguration().setSymbolResolver(
                 new JavaSymbolSolver(new CombinedTypeSolver())
@@ -53,16 +63,26 @@ public class StaticMethodExtractorService {
                     });
                 });
             } catch (IOException e) {
-                throw new RuntimeException("Error parsing source files", e);
+                throw new RuntimeException("Error parsing source files for session: " + sessionId, e);
             }
         });
         return methods;
     }
 
-    public String toJSON() {
-        List<MethodInfo> methods = extractMethods();
+    public String toJSON(String sessionId) {
+        List<MethodInfo> methods = extractMethods(sessionId);
         Gson gson = new GsonBuilder().setPrettyPrinting().create();
         return gson.toJson(methods);
+    }
+
+    // For backward compatibility
+    public List<MethodInfo> extractMethods() {
+        return extractMethods("default");
+    }
+
+    // For backward compatibility
+    public String toJSON() {
+        return toJSON("default");
     }
 
     // Inner class to represent method information
@@ -77,7 +97,7 @@ public class StaticMethodExtractorService {
             this.file = file;
         }
 
-        // Getters (setters can be added if needed)
+        // Getters
         public String getMethodName() {
             return methodName;
         }
