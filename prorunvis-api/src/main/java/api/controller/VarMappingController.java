@@ -11,9 +11,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpSession;
-
 @RestController
 @RequestMapping("/api/varMapping")
 public class VarMappingController {
@@ -23,26 +20,23 @@ public class VarMappingController {
      * declared on that line. For example, if the file "MyClass.java" has two
      * variables declared on line 15, this endpoint returns them.
      *
-     * URL example: GET /api/varMapping?file=MyClass.java&line=15
+     * URL example: GET /api/varMapping?file=MyClass.java&line=15&projectId=<projectId>
      */
     @GetMapping
     public ResponseEntity<List<String>> getVariables(
             @RequestParam String file,
             @RequestParam int line,
-            HttpServletRequest request) {
+            @RequestParam String projectId) {
 
-        // Get the session ID
-        HttpSession session = request.getSession(false);
-        if (session == null) {
+        if (projectId == null || projectId.isEmpty()) {
             return ResponseEntity.badRequest()
                     .body(Collections.emptyList());
         }
-        String sessionId = session.getId();
 
         VariableNameMapper mapper = new VariableNameMapper();
         try {
-            // Build the mapping from the session-specific source directory
-            mapper.buildVarNameMapping(Paths.get("resources/in/session-" + sessionId));
+            // Build the mapping from the project-specific source directory
+            mapper.buildVarNameMapping(Paths.get("resources/in/project-" + projectId));
         } catch (IOException e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(Collections.emptyList());

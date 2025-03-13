@@ -8,12 +8,10 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
-
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpSession;
+import org.springframework.web.bind.annotation.RequestParam;
 
 /**
- * Returns JSON from the processedTrace.json file in local_storage/session-<sessionId>/<localId>.
+ * Returns JSON from the processedTrace.json file in local_storage/project-<projectId>/<localId>.
  */
 @RestController
 @RequestMapping("/api/visualize")
@@ -34,16 +32,15 @@ public class VisualizationController {
      * 2) Parse it into an Object so Spring can produce real JSON with correct Content-Type.
      */
     @GetMapping(value = "/{localId}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<Object> getTraceJson(@PathVariable String localId,
-                                               HttpServletRequest request) {
-        // Get the session ID
-        HttpSession session = request.getSession(false);
-        if (session == null) {
-            return ResponseEntity.badRequest().body("No active session found. Please refresh the page.");
-        }
-        String sessionId = session.getId();
+    public ResponseEntity<Object> getTraceJson(
+            @PathVariable String localId,
+            @RequestParam String projectId) {
 
-        String rawJson = service.getTraceJson(localId, sessionId);
+        if (projectId == null || projectId.isEmpty()) {
+            return ResponseEntity.badRequest().body("No project ID provided. Please specify a project ID.");
+        }
+
+        String rawJson = service.getTraceJson(localId, projectId);
         try {
             // Convert the raw JSON string to a generic Object
             Object jsonObj = objectMapper.readValue(rawJson, Object.class);

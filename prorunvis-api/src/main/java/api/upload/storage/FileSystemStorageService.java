@@ -1,3 +1,4 @@
+// FileSystemStorageService.java
 package api.upload.storage;
 
 import jakarta.servlet.http.Part;
@@ -12,49 +13,25 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 
-/**
- * A Storage service used to store given data in a directory specified
- * through a {@link StorageProperties} element.
- */
 @Service
 public class FileSystemStorageService implements StorageService {
-
-    /**
-     * Base path to rootLocation.
-     */
     private final Path rootLocation;
-
-    /**
-     * Base path to out location.
-     */
     private final Path outLocation;
-
-    /**
-     * Base path to local storage location.
-     */
     private final Path localStorageLocation;
 
-    /**
-     * @param properties The storage properties for the storage service
-     */
     public FileSystemStorageService(final StorageProperties properties) {
         if (properties.getLocation().trim().isEmpty()) {
             throw new StorageException("File storage directory cannot be empty.");
         }
-
         this.rootLocation = Paths.get(properties.getLocation());
         if (properties.getOutLocation().trim().isEmpty()) {
             this.outLocation = Paths.get("resources/out");
         } else {
             this.outLocation = Paths.get(properties.getOutLocation());
         }
-
         this.localStorageLocation = Paths.get("resources/local_storage");
     }
 
-    /**
-     * Initializes the storage service by creating the base folders.
-     */
     @Override
     public void init() {
         try {
@@ -66,117 +43,77 @@ public class FileSystemStorageService implements StorageService {
         }
     }
 
-    /**
-     * Initializes storage for a specific session
-     *
-     * @param sessionId The unique session identifier
-     */
-
-    public void initSession(String sessionId) {
+    @Override
+    public void initProject(String projectId) {
         try {
-            Path sessionInPath = getSessionInPath(sessionId);
-            Path sessionOutPath = getSessionOutPath(sessionId);
-            Path sessionLocalStoragePath = getSessionLocalStoragePath(sessionId);
+            Path projectInPath = getProjectInPath(projectId);
+            Path projectOutPath = getProjectOutPath(projectId);
+            Path projectLocalStoragePath = getProjectLocalStoragePath(projectId);
 
-            Files.createDirectories(sessionInPath);
-            Files.createDirectories(sessionOutPath);
-            Files.createDirectories(sessionLocalStoragePath);
+            Files.createDirectories(projectInPath);
+            Files.createDirectories(projectOutPath);
+            Files.createDirectories(projectLocalStoragePath);
 
-            System.out.println("Initialized directories for session: " + sessionId);
-            System.out.println("  - Input: " + sessionInPath);
-            System.out.println("  - Output: " + sessionOutPath);
-            System.out.println("  - Local Storage: " + sessionLocalStoragePath);
-
+            System.out.println("Initialized directories for project: " + projectId);
+            System.out.println("  - Input: " + projectInPath);
+            System.out.println("  - Output: " + projectOutPath);
+            System.out.println("  - Local Storage: " + projectLocalStoragePath);
         } catch (IOException e) {
-            throw new StorageException("Could not create session directories for session: " + sessionId, e);
+            throw new StorageException("Could not create project directories for project: " + projectId, e);
         }
     }
 
-    /**
-     * Get the path to the session's input directory
-     */
-    private Path getSessionInPath(String sessionId) {
-        return rootLocation.resolve("session-" + sessionId);
+    private Path getProjectInPath(String projectId) {
+        return rootLocation.resolve("project-" + projectId);
     }
 
-    /**
-     * Get the path to the session's output directory
-     */
-    private Path getSessionOutPath(String sessionId) {
-        return outLocation.resolve("session-" + sessionId);
+    private Path getProjectOutPath(String projectId) {
+        return outLocation.resolve("project-" + projectId);
     }
 
-    /**
-     * Get the path to the session's local storage directory
-     */
-    private Path getSessionLocalStoragePath(String sessionId) {
-        return localStorageLocation.resolve("session-" + sessionId);
+    private Path getProjectLocalStoragePath(String projectId) {
+        return localStorageLocation.resolve("project-" + projectId);
     }
 
-    /**
-     * Returns the input location path for a session
-     */
-
-    public String getSessionInLocation(String sessionId) {
-        return getSessionInPath(sessionId).toString();
+    @Override
+    public String getProjectInLocation(String projectId) {
+        return getProjectInPath(projectId).toString();
     }
 
-    /**
-     * Returns the output location path for a session
-     */
-
-    public String getSessionOutLocation(String sessionId) {
-        return getSessionOutPath(sessionId).toString();
+    @Override
+    public String getProjectOutLocation(String projectId) {
+        return getProjectOutPath(projectId).toString();
     }
 
-    /**
-     * Returns the local storage path for a session
-     */
-
-    public String getSessionLocalStorageLocation(String sessionId) {
-        return getSessionLocalStoragePath(sessionId).toString();
+    @Override
+    public String getProjectLocalStorageLocation(String projectId) {
+        return getProjectLocalStoragePath(projectId).toString();
     }
 
-    /**
-     * Stores the contents of a file to a new {@link java.io.File}
-     * in the session-specific directory.
-     * @param part a part of a http-request representing a file to be stored
-     * @param sessionId the session identifier
-     */
-
-    public void store(final Part part, final String sessionId) {
+    @Override
+    public void store(final Part part, final String projectId) {
         try {
             String fileName = FilenameUtils.separatorsToSystem(part.getSubmittedFileName());
-            Path sessionPath = getSessionInPath(sessionId);
-            Path file = sessionPath.resolve(fileName);
+            Path projectPath = getProjectInPath(projectId);
+            Path file = projectPath.resolve(fileName);
 
             if (Files.notExists(file.getParent())) {
                 Files.createDirectories(file.getParent());
             }
-
             try (InputStream inputStream = part.getInputStream()) {
                 Files.copy(inputStream, file, StandardCopyOption.REPLACE_EXISTING);
             }
-
-            System.out.println("Stored file " + fileName + " for session: " + sessionId + " at: " + file);
-
+            System.out.println("Stored file " + fileName + " for project: " + projectId + " at: " + file);
         } catch (IOException e) {
-            throw new StorageException("Could not store file for session: " + sessionId, e);
+            throw new StorageException("Could not store file for project: " + projectId, e);
         }
     }
 
-    /**
-     * The original store method without session ID - kept for backward compatibility
-     * Will be removed once all code is updated to use the session-aware version
-     */
 
     public void store(final Part part) {
-        throw new StorageException("Session ID is required for file storage. Use store(part, sessionId) instead.");
+        throw new StorageException("Project ID is required for file storage. Use store(part, projectId) instead.");
     }
 
-    /**
-     * Recursively deletes all files in the directories
-     */
     @Override
     public void deleteAll() {
         FileSystemUtils.deleteRecursively(rootLocation.toFile());
@@ -191,33 +128,22 @@ public class FileSystemStorageService implements StorageService {
         }
     }
 
-    /**
-     * Deletes all data for a specific session
-     *
-     * @param sessionId The session identifier whose data should be deleted
-     */
     @Override
-    public void deleteAllForSession(String sessionId) {
-        Path sessionInPath = getSessionInPath(sessionId);
-        Path sessionOutPath = getSessionOutPath(sessionId);
-        Path sessionLocalStoragePath = getSessionLocalStoragePath(sessionId);
+    public void deleteAllForProject(String projectId) {
+        Path projectInPath = getProjectInPath(projectId);
+        Path projectOutPath = getProjectOutPath(projectId);
+        Path projectLocalStoragePath = getProjectLocalStoragePath(projectId);
 
-        System.out.println("Deleting files for session: " + sessionId);
-        System.out.println("  - From: " + sessionInPath);
-        System.out.println("  - From: " + sessionOutPath);
-        System.out.println("  - From: " + sessionLocalStoragePath);
-
-        FileSystemUtils.deleteRecursively(sessionInPath.toFile());
-        FileSystemUtils.deleteRecursively(sessionOutPath.toFile());
-        // We don't delete the session local storage as it may contain results
-        // from previous runs that the user still wants to view
+        System.out.println("Deleting files for project: " + projectId);
+        FileSystemUtils.deleteRecursively(projectInPath.toFile());
+        FileSystemUtils.deleteRecursively(projectOutPath.toFile());
 
         try {
-            Files.createDirectories(sessionInPath);
-            Files.createDirectories(sessionOutPath);
-            Files.createDirectories(sessionLocalStoragePath);
+            Files.createDirectories(projectInPath);
+            Files.createDirectories(projectOutPath);
+            Files.createDirectories(projectLocalStoragePath);
         } catch (IOException e) {
-            throw new StorageException("Could not recreate session directories after deletion for session: " + sessionId, e);
+            throw new StorageException("Could not recreate project directories after deletion for project: " + projectId, e);
         }
     }
 }

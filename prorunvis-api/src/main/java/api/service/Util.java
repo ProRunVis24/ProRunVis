@@ -39,14 +39,14 @@ public class Util {
                 .collect(Collectors.toList());
     }
 
-    public static String zipAndEncode(ProjectRoot projectRoot, String sessionId) {
-        // This zips the instrumented code output for a specific session
-        File instrumentedDir = new File("resources/out/session-" + sessionId + "/instrumented");
+    public static String zipAndEncode(ProjectRoot projectRoot, String projectId) {
+        // This zips the instrumented code output for a specific project
+        File instrumentedDir = new File("resources/out/project-" + projectId + "/instrumented");
         if (!instrumentedDir.exists()) {
-            throw new RuntimeException("Instrumented directory not found for session: " + sessionId);
+            throw new RuntimeException("Instrumented directory not found for project: " + projectId);
         }
 
-        File zipFile = new File("instrumented-session-" + sessionId + ".zip");
+        File zipFile = new File("instrumented-project-" + projectId + ".zip");
         zipDirectory(instrumentedDir, zipFile);
         byte[] content;
         try {
@@ -57,11 +57,6 @@ public class Util {
             throw new RuntimeException(e);
         }
         return Base64.getEncoder().encodeToString(content);
-    }
-
-    // For backward compatibility
-    public static String zipAndEncode(ProjectRoot projectRoot) {
-        return zipAndEncode(projectRoot, "default");
     }
 
     public static void zipDirectory(File sourceDir, File zipFile) {
@@ -85,11 +80,11 @@ public class Util {
         }
     }
 
-    public static File unzipAndDecode(String base64Zip, String sessionOutDir) {
+    public static File unzipAndDecode(String base64Zip, String projectOutDir) {
         // For simplicity, we'll just write out the zip and manually extract it
         byte[] data = Base64.getDecoder().decode(base64Zip);
 
-        File zipFile = new File(sessionOutDir, "instrumented_downloaded.zip");
+        File zipFile = new File(projectOutDir, "instrumented_downloaded.zip");
         try {
             // Create parent directory if it doesn't exist
             zipFile.getParentFile().mkdirs();
@@ -98,7 +93,7 @@ public class Util {
             throw new RuntimeException(e);
         }
 
-        File outputDir = new File(sessionOutDir, "downloaded_instrumented");
+        File outputDir = new File(projectOutDir, "downloaded_instrumented");
         if (!outputDir.exists()) {
             outputDir.mkdirs();
         }
@@ -121,11 +116,6 @@ public class Util {
         return outputDir;
     }
 
-    // For backward compatibility
-    public static File unzipAndDecode(String base64Zip) {
-        return unzipAndDecode(base64Zip, "resources/out");
-    }
-
     public static List<CompilationUnit> loadCUs(File instrumentedDir) {
         ProjectRoot pr = parseProject(instrumentedDir);
         return getCUs(pr);
@@ -139,22 +129,17 @@ public class Util {
         }
     }
 
-    public static File createTempTraceFile(String content, String sessionId) {
+    public static File createTempTraceFile(String content, String projectId) {
         try {
-            File sessionDir = new File("resources/out/session-" + sessionId);
-            if (!sessionDir.exists()) {
-                sessionDir.mkdirs();
+            File projectDir = new File("resources/out/project-" + projectId);
+            if (!projectDir.exists()) {
+                projectDir.mkdirs();
             }
-            File f = File.createTempFile("trace-session-" + sessionId + "-", ".tr", sessionDir);
+            File f = File.createTempFile("trace-project-" + projectId + "-", ".tr", projectDir);
             Files.write(f.toPath(), content.getBytes(StandardCharsets.UTF_8));
             return f;
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-    }
-
-    // For backward compatibility
-    public static File createTempTraceFile(String content) {
-        return createTempTraceFile(content, "default");
     }
 }

@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 
 /**
- * Reworked VisualizationService to read from session-specific locations
+ * Reworked VisualizationService to read from project-specific locations
  */
 @Service
 public class VisualizationService {
@@ -19,29 +19,24 @@ public class VisualizationService {
         // no repos needed
     }
 
-    public String getTraceJson(String localId, String sessionId) {
-        // find resources/local_storage/session-<sessionId>/<localId>/processedTrace.json
-        File localFolder = new File(LOCAL_STORAGE_DIR + "/session-" + sessionId, localId);
+    public String getTraceJson(String localId, String projectId) {
+        // find resources/local_storage/project-<projectId>/<localId>/processedTrace.json
+        File localFolder = new File(LOCAL_STORAGE_DIR + "/project-" + projectId, localId);
         if (!localFolder.exists() || !localFolder.isDirectory()) {
-            throw new RuntimeException("Local ID folder not found for session: " + sessionId +
+            throw new RuntimeException("Local ID folder not found for project: " + projectId +
                     " at: " + localFolder.getAbsolutePath());
         }
         File processedFile = new File(localFolder, "processedTrace.json");
         if (!processedFile.exists()) {
             throw new RuntimeException("No processedTrace.json found for ID: " + localId +
-                    " in session: " + sessionId);
+                    " in project: " + projectId);
         }
 
         try {
             byte[] content = Files.readAllBytes(processedFile.toPath());
             return new String(content, StandardCharsets.UTF_8);
         } catch (IOException e) {
-            throw new RuntimeException("Failed to read processedTrace.json for session: " + sessionId, e);
+            throw new RuntimeException("Failed to read processedTrace.json for project: " + projectId, e);
         }
-    }
-
-    // For backward compatibility
-    public String getTraceJson(String localId) {
-        return getTraceJson(localId, "default");
     }
 }

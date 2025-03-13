@@ -4,9 +4,7 @@ import api.functionality.StaticMethodExtractorService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
-
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpSession;
+import org.springframework.web.bind.annotation.RequestParam;
 
 @RestController
 public class StaticMethodController {
@@ -20,14 +18,11 @@ public class StaticMethodController {
 
     // Expose an endpoint that returns the static methods JSON
     @GetMapping("/api/static-methods")
-    public String getStaticMethods(HttpServletRequest request) {
-        // Get the session ID
-        HttpSession session = request.getSession(false);
-        if (session == null) {
-            throw new RuntimeException("No active session found. Please refresh the page.");
+    public String getStaticMethods(@RequestParam String projectId) {
+        if (projectId == null || projectId.isEmpty()) {
+            throw new RuntimeException("No project ID provided. Please specify a project ID.");
         }
-        String sessionId = session.getId();
 
-        return extractorService.toJSON(sessionId);
+        return extractorService.toJSON(projectId);
     }
 }

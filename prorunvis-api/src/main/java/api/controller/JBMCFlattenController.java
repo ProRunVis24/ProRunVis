@@ -8,9 +8,6 @@ import org.springframework.web.bind.annotation.*;
 import java.util.List;
 import java.util.logging.Logger;
 
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpSession;
-
 @RestController
 @RequestMapping("/api/jbmc/flatten")
 public class JBMCFlattenController {
@@ -27,28 +24,25 @@ public class JBMCFlattenController {
     }
 
     /**
-     * GET /api/jbmc/flatten
+     * GET /api/jbmc/flatten?projectId=<projectId>
      * Returns an array of FlattenedAssignment objects in JSON.
      */
     @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<?> getFlattenedAssignments(HttpServletRequest request) {
-        logger.info("Received request for flattened JBMC assignments.");
+    public ResponseEntity<?> getFlattenedAssignments(@RequestParam String projectId) {
+        logger.info("Received request for flattened JBMC assignments for project: " + projectId);
 
-        // Get the session ID
-        HttpSession session = request.getSession(false);
-        if (session == null) {
-            logger.warning("No active session found.");
-            return ResponseEntity.badRequest().body("No active session found. Please refresh the page.");
+        if (projectId == null || projectId.isEmpty()) {
+            logger.warning("No project ID provided.");
+            return ResponseEntity.badRequest().body("No project ID provided. Please specify a project ID.");
         }
-        String sessionId = session.getId();
 
-        // 1) Grab the last processed nodes from memory for this session
-        var nodeList = processingService.getLastProcessedNodes(sessionId);
+        // 1) Grab the last processed nodes from memory for this project
+        var nodeList = processingService.getLastProcessedNodes(projectId);
         if (nodeList == null || nodeList.isEmpty()) {
-            logger.warning("No in-memory trace data found for session: " + sessionId + ". Did you run /api/process yet?");
+            logger.warning("No in-memory trace data found for project: " + projectId + ". Did you run /api/process yet?");
             return ResponseEntity.badRequest().body("No in-memory trace data found. Did you run /api/process yet?");
         }
-        logger.info("Retrieved " + nodeList.size() + " processed trace nodes from memory for session: " + sessionId);
+        logger.info("Retrieved " + nodeList.size() + " processed trace nodes from memory for project: " + projectId);
 
         // 2) Flatten them
         List<JBMCFlattenService.FlattenedAssignment> flattened;
@@ -61,7 +55,7 @@ public class JBMCFlattenController {
         }
 
         // 3) Return as JSON
-        logger.info("Returning flattened JBMC assignments as JSON for session: " + sessionId);
+        logger.info("Returning flattened JBMC assignments as JSON for project: " + projectId);
         return ResponseEntity.ok(flattened);
     }
 }

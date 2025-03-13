@@ -6,9 +6,6 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpSession;
-
 @RestController
 @RequestMapping("/api/process")
 public class ProcessController {
@@ -20,24 +17,23 @@ public class ProcessController {
     }
 
     /**
-     * POST /api/process?traceId=<shortId>
+     * POST /api/process?traceId=<shortId>&projectId=<projectId>
      *
-     * We'll read local_storage/session-<sessionId>/<shortId>/Trace.tr,
+     * We'll read local_storage/project-<projectId>/<shortId>/Trace.tr,
      * produce processedTrace.json, store it in the same folder,
      * and return the shortId (or path) for the next step.
      */
     @PostMapping
-    public String processTrace(@RequestParam String traceId,
-                               HttpServletRequest request) {
-        // Get the session ID
-        HttpSession session = request.getSession(false);
-        if (session == null) {
-            throw new RuntimeException("No active session found. Please refresh the page.");
-        }
-        String sessionId = session.getId();
+    public String processTrace(
+            @RequestParam String traceId,
+            @RequestParam String projectId) {
 
-        // run the processing with session ID
-        processingService.processTrace(traceId, sessionId);
+        if (projectId == null || projectId.isEmpty()) {
+            throw new RuntimeException("No project ID provided. Please specify a project ID.");
+        }
+
+        // run the processing with project ID
+        processingService.processTrace(traceId, projectId);
 
         // return the same short ID for the front end
         // so the front end can do a GET /api/visualize/<traceId> if desired

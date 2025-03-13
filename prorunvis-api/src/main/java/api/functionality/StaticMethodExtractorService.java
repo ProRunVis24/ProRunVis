@@ -28,13 +28,13 @@ public class StaticMethodExtractorService {
         this.storageService = storageService;
     }
 
-    public List<MethodInfo> extractMethods(String sessionId) {
-        // Use the session-specific input location
-        String sourceLocation = storageService.getSessionInLocation(sessionId);
+    public List<MethodInfo> extractMethods(String projectId) {
+        // Use the project-specific input location
+        String sourceLocation = storageService.getProjectInLocation(projectId);
         File sourceDir = new File(sourceLocation);
 
         if (!sourceDir.exists()) {
-            System.out.println("Source directory does not exist for session: " + sessionId +
+            System.out.println("Source directory does not exist for project: " + projectId +
                     " at: " + sourceLocation);
             return new ArrayList<>();
         }
@@ -63,26 +63,16 @@ public class StaticMethodExtractorService {
                     });
                 });
             } catch (IOException e) {
-                throw new RuntimeException("Error parsing source files for session: " + sessionId, e);
+                throw new RuntimeException("Error parsing source files for project: " + projectId, e);
             }
         });
         return methods;
     }
 
-    public String toJSON(String sessionId) {
-        List<MethodInfo> methods = extractMethods(sessionId);
+    public String toJSON(String projectId) {
+        List<MethodInfo> methods = extractMethods(projectId);
         Gson gson = new GsonBuilder().setPrettyPrinting().create();
         return gson.toJson(methods);
-    }
-
-    // For backward compatibility
-    public List<MethodInfo> extractMethods() {
-        return extractMethods("default");
-    }
-
-    // For backward compatibility
-    public String toJSON() {
-        return toJSON("default");
     }
 
     // Inner class to represent method information

@@ -3,9 +3,6 @@ package api.controller;
 import api.service.TracingService;
 import org.springframework.web.bind.annotation.*;
 
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpSession;
-
 @RestController
 @RequestMapping("/api/trace")
 public class TraceController {
@@ -17,38 +14,22 @@ public class TraceController {
     }
 
     /**
-     * POST /api/trace?instrumentId=<localId>
-     * Runs the trace process for the given localId.
+     * POST /api/trace?instrumentId=<localId>&projectId=<projectId>
+     * Runs the trace process for the given localId and projectId.
      */
     @PostMapping
-<<<<<<< Updated upstream
-    public String runTrace(@RequestParam String instrumentId,
-                           HttpServletRequest request) {
-        HttpSession session = request.getSession(false);
-        if (session == null) {
-            throw new RuntimeException("No active session found. Please refresh the page.");
-        }
-        String sessionId = session.getId();
-
-        service.runTrace(instrumentId, sessionId);
-        return instrumentId; // Return the localId for further processing.
-=======
     public String runTrace(
             @RequestParam String instrumentId,
-            HttpServletRequest request) {
+            @RequestParam String projectId) {
 
-        // Get session ID from the request
-        HttpSession session = request.getSession(false);
-        if (session == null) {
-            throw new RuntimeException("No active session found. Please refresh the page.");
+        if (projectId == null || projectId.isEmpty()) {
+            throw new RuntimeException("No project ID provided. Please specify a project ID.");
         }
-        String sessionId = session.getId();
 
-        // Run the trace with both instrumentId and sessionId
-        service.runTrace(instrumentId, sessionId);
+        // Run the trace with both instrumentId and projectId
+        service.runTrace(instrumentId, projectId);
 
         // Return the instrument ID for the next step
         return instrumentId;
->>>>>>> Stashed changes
     }
 }
