@@ -1,10 +1,10 @@
 package api.controller;
 
 import api.service.TracingService;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
 
 @RestController
 @RequestMapping("/api/trace")
@@ -17,18 +17,38 @@ public class TraceController {
     }
 
     /**
-     * The client calls: POST /api/trace?instrumentId=<shortId>
-     * We do NOT return a big absolute path anymore.
-     * Instead, we just return the same short ID so the user can
-     * pass it to /api/process later.
+     * POST /api/trace?instrumentId=<localId>
+     * Runs the trace process for the given localId.
      */
     @PostMapping
-    public String runTrace(@RequestParam String instrumentId) {
-        // This will decode and produce the trace file "Trace.tr"
-        // in local_storage/<instrumentId>/Trace.tr.
-        service.runTrace(instrumentId);
+<<<<<<< Updated upstream
+    public String runTrace(@RequestParam String instrumentId,
+                           HttpServletRequest request) {
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            throw new RuntimeException("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
 
-        // Instead of returning an absolute path, we now just return the same short ID.
+        service.runTrace(instrumentId, sessionId);
+        return instrumentId; // Return the localId for further processing.
+=======
+    public String runTrace(
+            @RequestParam String instrumentId,
+            HttpServletRequest request) {
+
+        // Get session ID from the request
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            throw new RuntimeException("No active session found. Please refresh the page.");
+        }
+        String sessionId = session.getId();
+
+        // Run the trace with both instrumentId and sessionId
+        service.runTrace(instrumentId, sessionId);
+
+        // Return the instrument ID for the next step
         return instrumentId;
+>>>>>>> Stashed changes
     }
 }

@@ -11,6 +11,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpSession;
+
 @RestController
 @RequestMapping("/api/varMapping")
 public class VarMappingController {
@@ -25,12 +28,21 @@ public class VarMappingController {
     @GetMapping
     public ResponseEntity<List<String>> getVariables(
             @RequestParam String file,
-            @RequestParam int line) {
+            @RequestParam int line,
+            HttpServletRequest request) {
+
+        // Get the session ID
+        HttpSession session = request.getSession(false);
+        if (session == null) {
+            return ResponseEntity.badRequest()
+                    .body(Collections.emptyList());
+        }
+        String sessionId = session.getId();
+
         VariableNameMapper mapper = new VariableNameMapper();
         try {
-            // Build the mapping from the source directory.
-            // (Assuming your Java sources are in "resources/in")
-            mapper.buildVarNameMapping(Paths.get("resources/in"));
+            // Build the mapping from the session-specific source directory
+            mapper.buildVarNameMapping(Paths.get("resources/in/session-" + sessionId));
         } catch (IOException e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(Collections.emptyList());

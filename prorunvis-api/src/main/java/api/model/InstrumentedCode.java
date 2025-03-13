@@ -12,10 +12,10 @@ public class InstrumentedCode {
     private String projectName;
 
     @Lob
-    private String instrumentedSourceZip; // base64-encoded ZIP of instrumented source
+    private String instrumentedSourceZip;
 
     @Lob
-    private String nodeMapJson; // If you need to store the node map JSON from instrumentation
+    private String nodeMapJson;
 
     public Long getId() {
         return id;

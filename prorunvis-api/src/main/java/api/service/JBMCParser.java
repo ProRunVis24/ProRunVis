@@ -42,25 +42,18 @@ public class JBMCParser {
         try {
             JsonNode root = mapper.readTree(jbmcJson);
 
-            // If the root is an array, iterate over its elements.
             if (root.isArray()) {
                 for (JsonNode element : root) {
-                    // Look for a "result" field in each element.
                     if (element.has("result")) {
                         JsonNode resultArray = element.get("result");
                         if (resultArray.isArray()) {
-                            // Iterate over each result object.
                             for (JsonNode res : resultArray) {
-                                // Look for the "trace" field in the result.
                                 if (res.has("trace")) {
                                     JsonNode traceArray = res.get("trace");
                                     if (traceArray.isArray()) {
-                                        // Iterate over each step in the trace.
                                         for (JsonNode traceStep : traceArray) {
-                                            // Process all steps with a stepType of "assignment"
                                             if (traceStep.has("stepType") &&
                                                     "assignment".equals(traceStep.get("stepType").asText())) {
-                                                // Prefer "variableName" if it exists, otherwise use "lhs"
                                                 String variableName = "unknown";
                                                 if (traceStep.has("variableName")) {
                                                     variableName = traceStep.get("variableName").asText();
@@ -68,7 +61,6 @@ public class JBMCParser {
                                                     variableName = traceStep.get("lhs").asText();
                                                 }
 
-                                                // Extract the value; if "value" is an object with a "data" key, use that.
                                                 String value = "";
                                                 if (traceStep.has("value")) {
                                                     JsonNode valueNode = traceStep.get("value");
@@ -79,7 +71,6 @@ public class JBMCParser {
                                                     }
                                                 }
 
-                                                // Extract sourceLocation details.
                                                 String file = "unknown";
                                                 int line = -1;
                                                 if (traceStep.has("sourceLocation")) {
@@ -92,7 +83,6 @@ public class JBMCParser {
                                                     }
                                                 }
 
-                                                // Extract iteration information if present; default to -1 if not.
                                                 int iteration = -1;
                                                 if (traceStep.has("iteration")) {
                                                     iteration = traceStep.get("iteration").asInt(-1);
