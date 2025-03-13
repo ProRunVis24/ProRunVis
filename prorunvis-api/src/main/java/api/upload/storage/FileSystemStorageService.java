@@ -7,16 +7,18 @@ import org.springframework.util.FileSystemUtils;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 
+/**
+ * A Storage service used to store given data in a directory specified
+ * through a {@link StorageProperties} element.
+ */
 @Service
 public class FileSystemStorageService implements StorageService {
 
-<<<<<<< Updated upstream
-    private final Path rootLocation;  // e.g. resources/in
-    private final Path outLocation;   // e.g. resources/out
-
-=======
     /**
      * Base path to rootLocation.
      */
@@ -35,13 +37,12 @@ public class FileSystemStorageService implements StorageService {
     /**
      * @param properties The storage properties for the storage service
      */
->>>>>>> Stashed changes
     public FileSystemStorageService(final StorageProperties properties) {
         if (properties.getLocation().trim().isEmpty()) {
             throw new StorageException("File storage directory cannot be empty.");
         }
-        this.rootLocation = Paths.get(properties.getLocation());
 
+        this.rootLocation = Paths.get(properties.getLocation());
         if (properties.getOutLocation().trim().isEmpty()) {
             this.outLocation = Paths.get("resources/out");
         } else {
@@ -51,12 +52,9 @@ public class FileSystemStorageService implements StorageService {
         this.localStorageLocation = Paths.get("resources/local_storage");
     }
 
-<<<<<<< Updated upstream
-=======
     /**
      * Initializes the storage service by creating the base folders.
      */
->>>>>>> Stashed changes
     @Override
     public void init() {
         try {
@@ -68,51 +66,12 @@ public class FileSystemStorageService implements StorageService {
         }
     }
 
-    @Override
-    public void initSession(String sessionId) {
-        try {
-            Files.createDirectories(getSessionInPath(sessionId));
-            Files.createDirectories(getSessionOutPath(sessionId));
-            Files.createDirectories(Paths.get(getSessionLocalStoragePath(sessionId)));
-        } catch (IOException e) {
-            throw new StorageException("Could not create session directories for session: " + sessionId, e);
-        }
-    }
-
-    private Path getSessionInPath(String sessionId) {
-        return rootLocation.resolve("session-" + sessionId);
-    }
-
-    private Path getSessionOutPath(String sessionId) {
-        return outLocation.resolve("session-" + sessionId);
-    }
-
-    private String getSessionLocalStoragePath(String sessionId) {
-        return "resources/local_storage/session-" + sessionId;
-    }
-
-    @Override
-    public String getSessionInLocation(String sessionId) {
-        return getSessionInPath(sessionId).toString();
-    }
-
-    @Override
-    public String getSessionOutLocation(String sessionId) {
-        return getSessionOutPath(sessionId).toString();
-    }
-
     /**
-<<<<<<< Updated upstream
-     * DEPRECATED store method: we do not use this for multi-project,
-     * but we'll keep it for backward compatibility.
-     */
-    @Override
-=======
      * Initializes storage for a specific session
      *
      * @param sessionId The unique session identifier
      */
-    @Override
+
     public void initSession(String sessionId) {
         try {
             Path sessionInPath = getSessionInPath(sessionId);
@@ -157,7 +116,7 @@ public class FileSystemStorageService implements StorageService {
     /**
      * Returns the input location path for a session
      */
-    @Override
+
     public String getSessionInLocation(String sessionId) {
         return getSessionInPath(sessionId).toString();
     }
@@ -165,7 +124,7 @@ public class FileSystemStorageService implements StorageService {
     /**
      * Returns the output location path for a session
      */
-    @Override
+
     public String getSessionOutLocation(String sessionId) {
         return getSessionOutPath(sessionId).toString();
     }
@@ -173,7 +132,7 @@ public class FileSystemStorageService implements StorageService {
     /**
      * Returns the local storage path for a session
      */
-    @Override
+
     public String getSessionLocalStorageLocation(String sessionId) {
         return getSessionLocalStoragePath(sessionId).toString();
     }
@@ -184,8 +143,7 @@ public class FileSystemStorageService implements StorageService {
      * @param part a part of a http-request representing a file to be stored
      * @param sessionId the session identifier
      */
-    @Override
->>>>>>> Stashed changes
+
     public void store(final Part part, final String sessionId) {
         try {
             String fileName = FilenameUtils.separatorsToSystem(part.getSubmittedFileName());
@@ -195,30 +153,6 @@ public class FileSystemStorageService implements StorageService {
             if (Files.notExists(file.getParent())) {
                 Files.createDirectories(file.getParent());
             }
-            try (InputStream inputStream = part.getInputStream()) {
-                Files.copy(inputStream, file, StandardCopyOption.REPLACE_EXISTING);
-            }
-        } catch (IOException e) {
-            throw new StorageException("Could not store file for session: " + sessionId, e);
-        }
-    }
-
-    /**
-     * **NEW** Overload that uses sessionId/localId subfolder:
-     *    resources/in/session-<sessionId>/<localId>/<filename>
-     */
-    @Override
-    public void store(Part part, String sessionId, String localId) {
-        try {
-            String fileName = FilenameUtils.separatorsToSystem(part.getSubmittedFileName());
-            // subfolder for this project:
-            Path projectFolder = getSessionInPath(sessionId).resolve(localId);
-
-            if (Files.notExists(projectFolder)) {
-                Files.createDirectories(projectFolder);
-            }
-
-            Path file = projectFolder.resolve(fileName);
 
             try (InputStream inputStream = part.getInputStream()) {
                 Files.copy(inputStream, file, StandardCopyOption.REPLACE_EXISTING);
@@ -227,13 +161,6 @@ public class FileSystemStorageService implements StorageService {
             System.out.println("Stored file " + fileName + " for session: " + sessionId + " at: " + file);
 
         } catch (IOException e) {
-<<<<<<< Updated upstream
-            throw new StorageException("Could not store file for session="
-                    + sessionId + ", localId=" + localId, e);
-        }
-    }
-
-=======
             throw new StorageException("Could not store file for session: " + sessionId, e);
         }
     }
@@ -242,7 +169,7 @@ public class FileSystemStorageService implements StorageService {
      * The original store method without session ID - kept for backward compatibility
      * Will be removed once all code is updated to use the session-aware version
      */
-    @Override
+
     public void store(final Part part) {
         throw new StorageException("Session ID is required for file storage. Use store(part, sessionId) instead.");
     }
@@ -250,46 +177,29 @@ public class FileSystemStorageService implements StorageService {
     /**
      * Recursively deletes all files in the directories
      */
->>>>>>> Stashed changes
     @Override
     public void deleteAll() {
         FileSystemUtils.deleteRecursively(rootLocation.toFile());
         FileSystemUtils.deleteRecursively(outLocation.toFile());
-<<<<<<< Updated upstream
-        try {
-            Files.createDirectories(rootLocation);
-            Files.createDirectories(outLocation);
-=======
         FileSystemUtils.deleteRecursively(localStorageLocation.toFile());
         try {
             Files.createDirectories(rootLocation);
             Files.createDirectories(outLocation);
             Files.createDirectories(localStorageLocation);
->>>>>>> Stashed changes
         } catch (IOException e) {
             throw new StorageException("Could not recreate directories after deletion.", e);
         }
     }
 
-<<<<<<< Updated upstream
-=======
     /**
      * Deletes all data for a specific session
      *
      * @param sessionId The session identifier whose data should be deleted
      */
->>>>>>> Stashed changes
     @Override
     public void deleteAllForSession(String sessionId) {
         Path sessionInPath = getSessionInPath(sessionId);
         Path sessionOutPath = getSessionOutPath(sessionId);
-<<<<<<< Updated upstream
-        Path sessionLocalStoragePath = Paths.get(getSessionLocalStoragePath(sessionId));
-
-        FileSystemUtils.deleteRecursively(sessionInPath.toFile());
-        FileSystemUtils.deleteRecursively(sessionOutPath.toFile());
-        FileSystemUtils.deleteRecursively(sessionLocalStoragePath.toFile());
-=======
         Path sessionLocalStoragePath = getSessionLocalStoragePath(sessionId);
 
         System.out.println("Deleting files for session: " + sessionId);
@@ -301,7 +211,6 @@ public class FileSystemStorageService implements StorageService {
         FileSystemUtils.deleteRecursively(sessionOutPath.toFile());
         // We don't delete the session local storage as it may contain results
         // from previous runs that the user still wants to view
->>>>>>> Stashed changes
 
         try {
             Files.createDirectories(sessionInPath);

@@ -18,21 +18,16 @@ public class StaticMethodController {
         this.extractorService = extractorService;
     }
 
+    // Expose an endpoint that returns the static methods JSON
     @GetMapping("/api/static-methods")
     public String getStaticMethods(HttpServletRequest request) {
-<<<<<<< Updated upstream
-=======
         // Get the session ID
->>>>>>> Stashed changes
         HttpSession session = request.getSession(false);
         if (session == null) {
             throw new RuntimeException("No active session found. Please refresh the page.");
         }
         String sessionId = session.getId();
-<<<<<<< Updated upstream
-=======
 
->>>>>>> Stashed changes
         return extractorService.toJSON(sessionId);
     }
 }
