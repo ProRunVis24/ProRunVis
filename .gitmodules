@@ -1,4 +1,4 @@
 [submodule "frontend"]
-	path = frontend
-	url = ../prorunvis23-frontend.git
-	branch = main
+    path = frontend
+    url = https://github.com/ProRunVis24/prorunvis23-frontend.git
+    branch = main
