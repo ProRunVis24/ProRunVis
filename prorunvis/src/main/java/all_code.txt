@@ -1,0 +1,1908 @@
+===== ./prorunvis/ProRunVis.java =====
+package prorunvis;
+
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
+import com.github.javaparser.utils.ProjectRoot;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import org.apache.commons.cli.*;
+import prorunvis.instrument.Instrumenter;
+import prorunvis.preprocess.Preprocessor;
+import prorunvis.trace.process.TraceProcessor;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.*;
+
+public final class ProRunVis {
+    /**
+     * Private constructor for main is never called.
+     */
+    private ProRunVis() {
+    }
+
+    /**
+     * Entry point for the standalone usage of ProRunVis.
+     */
+    public static void main(final String[] args) {
+
+        boolean instrumentOnly = false;
+        String inputPath;
+        String outputPath = "resources/out";
+
+        Options options = new Options();
+        options.addOption(Option.builder("h")
+                .longOpt("help")
+                .desc("Prints this help message")
+                .build());
+        options.addOption(Option.builder("i")
+                .longOpt("instrument")
+                .desc("If the input should only be instrumented")
+                .build());
+        options.addOption(Option.builder("o")
+                .longOpt("output")
+                .hasArg()
+                .argName("output_directory")
+                .desc("Output file path")
+                .build());
+
+        CommandLineParser commandLineParser = new DefaultParser();
+        HelpFormatter formatter = new HelpFormatter();
+        CommandLine cmd;
+
+
+        try {
+            cmd = commandLineParser.parse(options, args);
+
+            //check if required input has been provided
+            String[] positionalArgs = cmd.getArgs();
+            if (positionalArgs.length < 1) {
+                throw new ParseException("Input file is required.");
+            }
+
+            inputPath = positionalArgs[0];
+            if (cmd.hasOption("o")) {
+                outputPath = cmd.getOptionValue("o");
+            }
+            if (cmd.hasOption("i")) {
+                instrumentOnly = true;
+            }
+            if (!Paths.get(inputPath).toFile().exists()
+                    || !Paths.get(inputPath).toFile().isDirectory()) {
+                throw new ParseException(inputPath + " is not an existing directory.");
+            }
+            if (!Paths.get(outputPath).toFile().exists()) {
+                if (!Paths.get(outputPath).toFile().mkdirs()) {
+                    throw new ParseException(outputPath + " is not an existing directory and could not be created.");
+                }
+            }
+        } catch (ParseException e) {
+            System.err.println(e.getMessage());
+            formatter.printHelp("java -jar <prorunvis.jar> <input_path> [options] \n\nWith options: \n", options);
+            System.exit(1);
+            return;
+        }
+
+        StaticJavaParser.getParserConfiguration().setSymbolResolver(new JavaSymbolSolver(new CombinedTypeSolver()));
+        ProjectRoot projectRoot = new SymbolSolverCollectionStrategy()
+                .collect(Paths.get(inputPath).toAbsolutePath());
+
+        File traceFile = new File(outputPath + "/Trace.tr");
+
+        List<CompilationUnit> cus = new ArrayList<>();
+        projectRoot.getSourceRoots().forEach(sr -> {
+            try {
+                sr.tryToParse().forEach(cu -> cus.add(cu.getResult().orElseThrow()));
+            } catch (IOException | NoSuchElementException e) {
+                throw new RuntimeException("Error parsing compilation units: " + e.getMessage(), e);
+            }
+        });
+
+        Map<Integer, Node> map = new HashMap<>();
+        Instrumenter.setupTrace(traceFile);
+        cus.forEach(cu -> {
+            Preprocessor.run(cu);
+            Instrumenter.run(cu, map);
+        });
+        Instrumenter.saveInstrumented(projectRoot, outputPath + "/instrumented");
+
+        // If not instrument-only, compile, run and process trace
+        if (!instrumentOnly) {
+            try {
+                CompileAndRun.run(cus, outputPath + "/instrumented", outputPath + "/compiled");
+                TraceProcessor processor = new TraceProcessor(map, traceFile.getPath(), Paths.get(inputPath));
+                processor.start();
+
+                //save json trace to file
+                File jsonTrace = new File(outputPath + "/Trace.json");
+                try (BufferedWriter writer = new BufferedWriter(new FileWriter(jsonTrace))) {
+                    Gson gson = new GsonBuilder().serializeNulls().setPrettyPrinting().create();
+                    writer.write(gson.toJson(processor.getNodeList()));
+                }
+            } catch (IOException | InterruptedException e) {
+                System.err.println("Error during run or process: " + e.getMessage());
+            }
+        }
+
+    }
+}===== ./prorunvis/trace/TracedCode.java =====
+package prorunvis.trace;
+
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.stmt.*;
+
+/**
+ * This enum notates all code types which are currently being traced.
+ */
+public enum TracedCode {
+
+    /**
+     * Entry for try-statements.
+     */
+    TRY_STMT(TryStmt.class),
+
+    /**
+     * Entry for catch-statements.
+     */
+    CATCH_CLAUSE(CatchClause.class),
+
+    /**
+     * Entry for for-statements.
+     */
+    FOR_STMT(ForStmt.class),
+
+    /**
+     * Entry for while-statements.
+     */
+    WHILE_STMT(WhileStmt.class),
+
+    /**
+     * Entry for do-statements.
+     */
+    DO_STMT(DoStmt.class),
+
+    /**
+     * Entry for switch-statements.
+     */
+    SWITCH_CASE(SwitchStmt.class),
+
+    /**
+     * Entry for if-statements.
+     */
+    IF_STMT(IfStmt.class);
+
+    /**
+     * The corresponding AST-Node of this codetype.
+     */
+    private final Class<? extends Node> type;
+
+    /**
+     * Returns the type for this entry.
+     * @return the type
+     */
+    public Class<? extends Node> getType() {
+        return type;
+    }
+
+    TracedCode(final Class<? extends Node> type) {
+        this.type = type;
+    }
+}
+===== ./prorunvis/trace/TraceVisitor.java =====
+package prorunvis.trace;
+
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.stmt.*;
+import com.github.javaparser.ast.visitor.ModifierVisitor;
+
+import java.util.Map;
+
+
+/**
+ * This Visitor extends the standard ModifierVisitor and overwrites the visit methods for each codetype being traced
+ * in order to instrument them with the needed trace call.
+ */
+public class TraceVisitor extends ModifierVisitor<Map<Integer, Node>> {
+
+    /**
+     * Add a trace call to every try statement. Trace call is added as the first line of the try statement body and to
+     * the first line of the body of every corresponding catch statement.
+     *
+     * @param stmt the statement to be instrumented
+     * @param map  maps the current ID to this node
+     * @return the modified statement
+     */
+    public TryStmt visit(final TryStmt stmt, final Map<Integer, Node> map) {
+
+        int id = map.size();
+        createMapEntry(id, map, stmt);
+        stmt.getTryBlock().addStatement(0, traceEntryCreator(id));
+
+        for (CatchClause clause : stmt.getCatchClauses()) {
+            id = map.size();
+            createMapEntry(id, map, clause);
+            clause.getBody().addStatement(0, traceEntryCreator(id));
+        }
+
+        if (stmt.getFinallyBlock().isPresent()) {
+            id = map.size();
+            createMapEntry(id, map, stmt.getFinallyBlock().get());
+            stmt.getFinallyBlock().get().addStatement(0, traceEntryCreator(id));
+        }
+
+        super.visit(stmt, map);
+        return stmt;
+    }
+
+    /**
+     * Add a trace call to every do loop body. Trace call is added as the first line of the loop body.
+     *
+     * @param stmt the statement to be instrumented
+     * @param map  maps the current ID to this node
+     * @return the modified statement
+     */
+    @Override
+    public DoStmt visit(final DoStmt stmt, final Map<Integer, Node> map) {
+
+        int id = map.size();
+        createMapEntry(id, map, stmt);
+        stmt.getBody().asBlockStmt().addStatement(0, traceEntryCreator(id));
+        super.visit(stmt, map);
+        return stmt;
+    }
+
+    /**
+     * Add a trace call to every for loop body. Trace call is added as the first line of the loop body.
+     *
+     * @param stmt the statement to be instrumented
+     * @param map  maps the current ID to this node
+     * @return the modified statement
+     */
+    @Override
+    public ForStmt visit(final ForStmt stmt, final Map<Integer, Node> map) {
+
+        int id = map.size();
+        createMapEntry(id, map, stmt);
+        stmt.getBody().asBlockStmt().addStatement(0, traceEntryCreator(id));
+        super.visit(stmt, map);
+        return stmt;
+    }
+
+    /**
+     * Add a trace call to every then and else block of an if-statement. Trace call is added as the first line of
+     * the if-body and else-body if present.
+     *
+     * @param stmt the statement to be instrumented
+     * @param map  maps the current ID to this node
+     * @return the modified statement
+     */
+    @Override
+    public IfStmt visit(final IfStmt stmt, final Map<Integer, Node> map) {
+        //add a methodCall to proRunVisTrace to the then-block of stmt
+
+        int id = map.size();
+        createMapEntry(id, map, stmt.getThenStmt());
+        stmt.getThenStmt().asBlockStmt().addStatement(0, traceEntryCreator(id));
+
+        //check if stmt has an else-block
+        if (stmt.getElseStmt().isPresent()) {
+            id = map.size();
+            //exclude cases with else-if statements since these will be visited by the
+            //if-stmt visitor separately
+            if (!stmt.getElseStmt().get().isIfStmt()) {
+                createMapEntry(id, map, stmt.getElseStmt().get());
+                stmt.getElseStmt().get().asBlockStmt().addStatement(0, traceEntryCreator(id));
+            }
+        }
+
+        super.visit(stmt, map);
+        return stmt;
+    }
+
+    /**
+     * Add a trace call to every method declaration body (if not a forward declaration).
+     * Trace call is added as the first line of the method body.
+     *
+     * @param decl the declaration to be instrumented
+     * @param map  maps the current ID to this node
+     * @return the modified method
+     */
+    @Override
+    public MethodDeclaration visit(final MethodDeclaration decl, final Map<Integer, Node> map) {
+
+        if (decl.getBody().isPresent()) {
+            int id = map.size();
+            createMapEntry(id, map, decl);
+            decl.getBody().get().addStatement(0, traceEntryCreator(id));
+        }
+
+        super.visit(decl, map);
+        return decl;
+    }
+
+    /**
+     * Add a trace call to every case in a switch statement.
+     * Trace call is added as the first line of the body of every case in the switch statement.
+     *
+     * @param stmt the statement to be instrumented
+     * @param map  maps the current ID to this node
+     * @return the modified statement
+     */
+    @Override
+    public SwitchStmt visit(final SwitchStmt stmt, final Map<Integer, Node> map) {
+
+        for (SwitchEntry entry : stmt.getEntries()) {
+            int id = map.size();
+            createMapEntry(id, map, entry);
+            entry.addStatement(0, traceEntryCreator(id));
+        }
+
+        super.visit(stmt, map);
+        return stmt;
+    }
+
+    /**
+     * Add a trace call to every while loop body. Trace call is added as the first line of the loop body.
+     *
+     * @param stmt the statement to be instrumented
+     * @param map  maps the current ID to this node
+     * @return the modified statement
+     */
+    @Override
+    public WhileStmt visit(final WhileStmt stmt, final Map<Integer, Node> map) {
+
+        int id = map.size();
+        createMapEntry(id, map, stmt);
+        stmt.getBody().asBlockStmt().addStatement(0, traceEntryCreator(id));
+
+        super.visit(stmt, map);
+        return stmt;
+    }
+
+    /**
+     * A private method which collects the characteristics of the given statement into a new statement
+     * containing the trace call, which can then be added to the original code.
+     *
+     * @param id the current id to be printed
+     * @return a statement containing the call to the trace methode with the characteristics of the given statement
+     */
+    private Statement traceEntryCreator(final int id) {
+        return StaticJavaParser.parseStatement("prorunvis.Trace.next_elem(" + id + ");");
+    }
+
+    /**
+     * Creates a map entry with a clone of the given node while preserving its range.
+     *
+     * @param id   the key to map
+     * @param map  the map in which to put the entry
+     * @param node the value to map
+     */
+    private void createMapEntry(final int id, final Map<Integer, Node> map, final Node node) {
+        Node entry = node.clone().setRange(node.getRange().get());
+        entry.setParentNode(node.findCompilationUnit().get().clone());
+        map.put(id, entry);
+    }
+}
+===== ./prorunvis/trace/TraceNode.java =====
+package prorunvis.trace;
+
+import com.github.javaparser.Range;
+import prorunvis.trace.process.JumpLink;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+// *** CHANGED: import for List<VarValue> ***
+import java.util.HashMap;
+
+/**
+ * This class serves as Node for a type of tree, with each node containing information about which lines of code have
+ * been executed, from where the code block has been called and which code blocks, represented by other TraceNodes,
+ * have been executed within this node.
+ */
+public class TraceNode {
+
+    /**
+     * *** CHANGED: Replaced "private Map<String, String> jbmcValues;" ***
+     * Now we store a list of (iteration, value) pairs for each variable name.
+     */
+    private Map<String, List<VarValue>> jbmcValues; // *** CHANGED ***
+
+    /**
+     * A List containing the ranges of executed source code
+     * within this node.
+     */
+    private List<Range> ranges;
+
+    /**
+     * A List containing TraceNodes for code blocks inside
+     * of this node.
+     */
+    private List<Integer> childrenIndices;
+
+    /**
+     * The node within which this node is located.
+     */
+    private final Integer parentIndex;
+
+    /**
+     * The Range of code which serves as link to access this node.
+     */
+    private JumpLink link;
+
+    /**
+     * The Ranges of code which serve as links to access the out node.
+     */
+    private List<JumpLink> outLinks;
+
+    /**
+     * The TraceNode to select upon following the link in outLink.
+     */
+    private int outIndex;
+
+    /**
+     * The index of the current iteration if TraceNode is of the loop type.
+     */
+    private Integer iteration;
+
+    /**
+     * The ID that maps the Node to an ASTNode.
+     */
+    private String traceId;
+    private String nodeMethodName;        // e.g. "myMethod"
+    private String nodeMethodSignature;   // e.g. "MyClass.myMethod:([I)I"
+
+    /**
+     * Constructs a {@link TraceNode} object.
+     * @param parentIndex The index of the node within which this node is located.
+     * @param traceId The Id that maps this node to the AST
+     */
+    public TraceNode(final Integer parentIndex, final String traceId) {
+        this.ranges = new ArrayList<>();
+        this.childrenIndices = new ArrayList<>();
+        this.outLinks = new ArrayList<>();
+        this.parentIndex = parentIndex;
+        this.traceId = traceId;
+        this.iteration = null;
+
+        // *** CHANGED: Initialize jbmcValues as an empty map. ***
+        this.jbmcValues = new HashMap<>();
+    }
+
+    public String getNodeMethodName() {
+        return nodeMethodName;
+    }
+
+    public void setNodeMethodName(String nodeMethodName) {
+        this.nodeMethodName = nodeMethodName;
+    }
+
+    public String getNodeMethodSignature() {
+        return nodeMethodSignature;
+    }
+
+    public void setNodeMethodSignature(String nodeMethodSignature) {
+        this.nodeMethodSignature = nodeMethodSignature;
+    }
+    /**
+     * *** CHANGED: GETTER for the new jbmcValues type. ***
+     */
+    public Map<String, List<VarValue>> getJbmcValues() {
+        return jbmcValues;
+    }
+
+    /**
+     * *** CHANGED: SETTER for the new jbmcValues type. ***
+     */
+    public void setJbmcValues(Map<String, List<VarValue>> jbmcValues) {
+        this.jbmcValues = jbmcValues;
+    }
+
+    /**
+     *
+     * Add a new {@link Range} object to the list of ranges of this node.
+     * @param range The range of the executed code.
+     */
+    public void addRange(final Range range) {
+        this.ranges.add(range);
+    }
+
+    /**
+     * @return The List of Ranges of this node.
+     */
+    public List<Range> getRanges() {
+        return this.ranges;
+    }
+
+    /**
+     * Set the ranges for the code executed within this node.
+     * @param newRanges A list of {@link Range} objects representing
+     *                 executed code.
+     */
+    public void setRanges(final List<Range> newRanges) {
+        this.ranges = newRanges;
+    }
+
+    /**
+     * Add a new index for a {@link TraceNode} object to the list of children of this node.
+     * @param childIndex An index of a node within this TraceNode.
+     */
+    public void addChildIndex(final int childIndex) {
+        this.childrenIndices.add(childIndex);
+    }
+
+    /**
+     * @return The list of indices of children of this node.
+     */
+    public List<Integer> getChildrenIndices() {
+        return this.childrenIndices;
+    }
+
+    /**
+     * Set the code blocks located within this node.
+     * @param childrenIndices A list of indices of {@link TraceNode} objects representing
+     *                        code blocks.
+     */
+    public void setChildrenIndices(final List<Integer> childrenIndices) {
+        this.childrenIndices = childrenIndices;
+    }
+
+    /**
+     * Gets the parent index of this node.
+     * @return The index of the node within which this node is located.
+     */
+    public Integer getParentIndex() {
+        return this.parentIndex;
+    }
+
+    /**
+     * Gets the link for this node.
+     * @return The Range of code which serves as link for
+     *          this node.
+     */
+    public JumpLink getLink() {
+        return this.link;
+    }
+
+    /**
+     * Sets the link for this node.
+     * @param newLink The Range of code to be used as link for
+     *                this node.
+     */
+    public void setLink(final JumpLink newLink) {
+        this.link = newLink;
+    }
+
+    /**
+     * Gets the outLink of this node.
+     * @return The range of code which serves as outLink
+     *         of this node.
+     */
+    public List<JumpLink> getOutLinks() {
+        return this.outLinks;
+    }
+
+    /**
+     * Sets the outLink of this node.
+     * @param newOutLink The Range of code to be used as outLink
+     *                   for this node.
+     */
+    public void addOutLink(final JumpLink newOutLink) {
+        this.outLinks.add(newOutLink);
+    }
+
+    /**
+     * Gets the index of the out node of this node.
+     * @return The index of the node to be highlighted after using the
+     *         {@link #outLinks} of this node.
+     */
+    public int getOutIndex() {
+        return this.outIndex;
+    }
+
+    /**
+     * Sets the index of the out node of this node.
+     * @param outIndex The index of the node to be highlighted after using the
+     *        {@link #outLinks} of this node.
+     */
+    public void setOut(final int outIndex) {
+        this.outIndex = outIndex;
+    }
+
+    /**
+     * Gets the Trace ID of this node.
+     * @return TraceId of the TraceNode
+     */
+    public String getTraceID() {
+        return this.traceId;
+    }
+
+    /**
+     * Sets the iteration value of this node.
+     * @param iteration The current iteration of the loop, so the number of times this TraceNode repeated itself so far
+     */
+    public void setIteration(final Integer iteration) {
+        this.iteration = iteration;
+    }
+
+    /**
+     * Gets the iteration value of this node.
+     * @return The iteration of the TraceNode, if TraceNode is not a loop returns null.
+     */
+    public Integer getIteration() {
+        return iteration;
+    }
+
+    // *** CHANGED: Introduce the VarValue helper class for (iteration, value) pairs. ***
+    // --- UPDATED VarValue Class ---
+    public static class VarValue {
+        private final String traceId;  // New field to hold the trace id.
+        private final int iteration;
+        private final String value;
+
+        public VarValue(String traceId, int iteration, String value) {
+            this.traceId = traceId;
+            this.iteration = iteration;
+            this.value = value;
+        }
+
+        public String getTraceId() {
+            return traceId;
+        }
+
+        public int getIteration() {
+            return iteration;
+        }
+
+        public String getValue() {
+            return value;
+        }
+        @Override
+        public String toString() {
+            return "{\"traceId\": \"" + traceId + "\", \"iteration\": " + iteration + ", \"value\": \"" + value + "\"}";
+        }
+    }
+}===== ./prorunvis/trace/process/Scanner.java =====
+package prorunvis.trace.process;
+
+import java.io.*;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+
+/**
+ * A Scanner used by {@link TraceProcessor} to convert a
+ * trace file to a stack of trace id's for further
+ * processing.
+ */
+public class Scanner {
+
+    /**
+     * The stream of tokens from the trace file.
+     */
+    private final Stack<Integer> tokens;
+
+    /**
+     * The path to the trace file read by this scanner.
+     */
+    private final Path pathToTrace;
+
+    /**
+     * Constructs a scanner to read a token stream of trace ids.
+     *
+     * @param path The path to the trace file.
+     */
+    public Scanner(final String path) {
+        this.tokens = new Stack<>();
+        this.pathToTrace = Paths.get(path);
+    }
+
+    /**
+     * Reads the file specified by {@link #pathToTrace} to {@link #tokens}
+     * in reverse order.
+     *
+     * @return a stack of Integers containing the trace id's with the top element
+     * being the first id in the trace
+     * @throws IOException If the file does not exist or could not be
+     *                     opened for other reasons.
+     */
+    public Stack<Integer> readFile() throws IOException {
+
+        try {
+            File traceFile = pathToTrace.toFile();
+            BufferedReader reader = new BufferedReader(new FileReader(traceFile));
+            List<String> temp = new ArrayList<>(reader.lines().toList());
+            //reverse the list before pushing on the stack to get the correct order
+            Collections.reverse(temp);
+            temp.forEach(x -> tokens.push(Integer.parseInt(x)));
+            //close reader
+            reader.close();
+        } catch (FileNotFoundException e) {
+            throw new IOException("Could not read file.", e);
+        }
+
+        return tokens;
+    }
+}
+===== ./prorunvis/trace/process/JumpLink.java =====
+package prorunvis.trace.process;
+
+import com.github.javaparser.Range;
+
+
+/**
+ * This class is used for links in {@link prorunvis.trace.TraceNode} objects, providing
+ * the range and target file of the link.
+ */
+public class JumpLink extends Range {
+
+    /**
+     * A string representation of the relative path
+     * to the file this link object points to.
+     */
+    private final String filepath;
+
+    /**
+     * Construct a JumpLink object with a range and target.
+     *
+     * @param range    The range of code to use as link.
+     * @param filepath The relative path to the target file as String.
+     */
+    public JumpLink(final Range range, final String filepath) {
+        super(range.begin, range.end);
+        this.filepath = filepath;
+    }
+
+    /**
+     * Creates a string representation of this JumpLink.
+     *
+     * @return A String representing start, end and target of this JumpLink.
+     */
+    @Override
+    public String toString() {
+        return "(" + super.toString() + "," + this.filepath + ")";
+    }
+    /**
+     * Getter for the filepath.
+     *
+     * @return the relative file path as a String.
+     */
+    public String getFilepath() {
+        return this.filepath;
+    }
+}
+===== ./prorunvis/trace/process/JumpPackage.java =====
+package prorunvis.trace.process;
+
+import com.github.javaparser.Range;
+import com.github.javaparser.ast.Node;
+
+import java.util.List;
+
+/**
+ * Objects of this class signify that a link is created from one {@link prorunvis.trace.TraceNode}
+ * to another, carrying the information necessary over multiple recursive layers.
+ */
+public final class JumpPackage {
+
+    /**
+     * List of NodeTypes this jump closes, used to determine to which
+     * {@link prorunvis.trace.TraceNode} the jump should return to.
+     */
+    private final List<Class<? extends Node>> jumpTo;
+
+    /**
+     * {@link Range} of the keyword which triggered the jump, so it can be set as the {@link Range} of the outLink.
+     */
+    private final Range jumpFrom;
+
+    /**
+     * index of the {@link prorunvis.trace.TraceNode} from which a jump originated.
+     */
+    private final int start;
+
+    /**
+     * Creates a new {@link JumpPackage}, signaling that a jump has started.
+     * @param targets list of {@link Node}Types this jump closes.
+     * @param link keyword which triggered the jump.
+     * @param start {@link Range} of the keyword which triggered the jump.
+     */
+    public JumpPackage(final List<Class<? extends Node>> targets, final Range link, final int start) {
+        jumpTo = targets;
+        jumpFrom = link;
+        this.start = start;
+    }
+
+    /**
+     * Checks whether the current {@link Node} closes the current jump.
+     * @param node {@link Node} to test.
+     * @return true if {@link Node} closes the jump, false otherwise.
+     */
+    public boolean isTarget(final Node node) {
+        return jumpTo.contains(node.getClass());
+    }
+
+    /**
+     * @return the range of the keyword which triggered the jump.
+     */
+    public Range getJumpFrom() {
+        return jumpFrom;
+    }
+
+    /**
+     * @return the index of the {@link prorunvis.trace.TraceNode} from which the jump originated.
+     */
+    public int getStart() {
+        return start;
+    }
+}
+===== ./prorunvis/trace/process/TraceProcessor.java =====
+package prorunvis.trace.process;
+
+import com.github.javaparser.Range;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.SimpleName;
+import com.github.javaparser.ast.nodeTypes.NodeWithStatements;
+import com.github.javaparser.ast.nodeTypes.NodeWithBody;
+import com.github.javaparser.ast.nodeTypes.NodeWithOptionalBlockStmt;
+import com.github.javaparser.ast.nodeTypes.NodeWithBlockStmt;
+import com.github.javaparser.ast.stmt.*;
+import com.google.common.collect.Iterables;
+import prorunvis.trace.TraceNode;
+import prorunvis.trace.TracedCode;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.stream.Stream;
+
+/**
+ * This class is used to convert a previously generated id-trace
+ * to a type of tree representation.
+ * The resulting tree consists of {@link TraceNode} objects in a
+ * list with index-based references to parents and children.
+ */
+public class TraceProcessor {
+
+    /**
+     * A list containing all the trace nodes in the tree.
+     */
+    private final List<TraceNode> nodeList;
+
+    /**
+     * A map which contains the corresponding {@link Node} of
+     * the AST for every trace id.
+     */
+    private final Map<Integer, Node> traceMap;
+
+    /**
+     * The current trace node, serves as a global save state
+     * across multiple recursions.
+     */
+    private TraceNode current;
+
+    /**
+     * The corresponding AST node for current.
+     */
+    private Node nodeOfCurrent;
+
+    /**
+     * A scanner object used to convert the trace file
+     * into single trace id's.
+     */
+    private final Scanner scanner;
+
+    /**
+     * A stack containing the trace id's in correct
+     * order generated by {@link #scanner}.
+     */
+    private Stack<Integer> tokens;
+
+    /**
+     * A list that is used to track ranges of method-calls that
+     * have already been added as caller for a trace node, so that
+     * multiple calls to a method in the same scope can be correctly
+     * associated with the respective call-statement.
+     */
+    private List<Range> methodCallRanges;
+
+    /**
+     * Object which is instantiated when a jump keyword
+     * has been found. It contains information about how
+     * to set up the corresponding links.
+     */
+    private JumpPackage jumpPackage;
+
+    /**
+     * A Path pointing to the root directory of the original project
+     * that can be used to get the relative paths of the files to each other.
+     */
+    private final Path rootDir;
+
+    /**
+     * Constructs a TraceProcessor for the given parameters.
+     *
+     * @param trace         A map containing all the possible trace-id's
+     *                      and their corresponding nodes in the AST.
+     * @param traceFilePath A string representation of the path to
+     *                      the trace file containing the actual
+     *                      recorded trace.
+     * @param rootDir       The path to the root directory of the original project.
+     */
+    public TraceProcessor(final Map<Integer, Node> trace, final String traceFilePath, final Path rootDir) {
+        this.nodeList = new LinkedList<>();
+        this.traceMap = trace;
+        this.scanner = new Scanner(traceFilePath);
+        this.methodCallRanges = new ArrayList<>();
+        this.rootDir = rootDir.toAbsolutePath();
+    }
+
+    // -------------- Add this near the top of TraceProcessor (or as a private static method) --------------
+    private static String toJvmDescriptor(com.github.javaparser.ast.type.Type type) {
+        // For arrays, primitives, reference types, or void.
+        if (type.isArrayType()) {
+            // e.g. int[] => "[I"
+            // so we do "[" plus the component type
+            return "[" + toJvmDescriptor(type.asArrayType().getComponentType());
+        }
+        if (type.isPrimitiveType()) {
+            switch (type.asPrimitiveType().asString()) {
+                case "boolean": return "Z";
+                case "byte":    return "B";
+                case "char":    return "C";
+                case "short":   return "S";
+                case "int":     return "I";
+                case "long":    return "J";
+                case "float":   return "F";
+                case "double":  return "D";
+            }
+        }
+        if (type.isVoidType()) {
+            return "V";
+        }
+
+        // Otherwise, must be a Class/Interface type.
+        // We'll do "Lfully/qualified/ClassName;"
+        // e.g. "java.lang.String" => "Ljava/lang/String;"
+        // (Here we rely on type.asString() => "String" or "java.util.List", etc.)
+        String rawName = type.asString();
+        // if it's something like "String", we can’t know the package unless we do more resolution.
+        // But to keep it simple, let's assume the type is "java.lang.String" or the short name.
+        // We'll replace '.' or generics with '/', then wrap in L...;
+
+        // remove generics <...>, if any:
+        rawName = rawName.replaceAll("<.*>", "");
+        // replace '.' with '/' (if user wrote fully qualified types)
+        rawName = rawName.replace('.', '/');
+        // also replace package if we can’t find it, you might do partial.
+        // Minimal approach: just do "L" + rawName + ";"
+        return "L" + rawName.replaceAll("\\.", "/") + ";";
+    }
+
+    /**
+     * Start the processor by creating the token stack and
+     * the root for the tree.
+     *
+     * @throws IOException If the scanner can not open
+     *                     or correctly read the trace file.
+     */
+    public void start() throws IOException {
+
+        //read tokens to stack
+        try {
+            tokens = scanner.readFile();
+        } catch (IOException e) {
+            throw new IOException("Could not read trace file.", e);
+        }
+
+        createRoot();
+    }
+
+    /**
+     * Creates the root node for the tree, which has no parent
+     * and one guaranteed child-node for the first id in the trace.
+     */
+    private void createRoot() {
+        TraceNode root = new TraceNode(null, "root");
+        nodeList.add(root);
+        current = root;
+
+        //add the first node as child to root
+        createNewTraceNode();
+
+        //add a default link to the first trace node for identifying the entry point
+        TraceNode main = nodeList.get(current.getChildrenIndices().get(0));
+        Node mainNode = traceMap.get(Integer.parseInt(main.getTraceID()));
+        Path path = mainNode.findCompilationUnit().get()
+                .getStorage().get().getPath();
+        String file = rootDir.relativize(path).toString();
+        Range range = ((MethodDeclaration) mainNode).getName().getRange().get();
+        JumpLink link = new JumpLink(range, file);
+        main.setLink(link);
+    }
+
+    /**
+     * Process a child of the current node by determining if the next
+     * code block is a child of current and if yes, create it.
+     *
+     * @return false if a child was created to indicate that the children
+     * for current are not finished, true otherwise.
+     */
+    private boolean processChild() {
+
+        if (tokens.empty()) {
+            return false;
+        }
+
+        Node node = traceMap.get(tokens.peek());
+
+        //check if the node is a method declaration or not
+        if (node instanceof MethodDeclaration) {
+            return createMethodCallTraceNode();
+        } else {
+
+            Optional<Range> range = node.getRange();
+            Optional<Range> currentRange = nodeOfCurrent.getRange();
+
+            //check if the next traced node is located within the node
+            //of current
+            if (range.isPresent() && currentRange.isPresent()
+                && node.findCompilationUnit().get().getStorage().get().getFileName().equals(
+                   nodeOfCurrent.findCompilationUnit().get().getStorage().get().getFileName())) {
+                if (currentRange.get().strictlyContains(range.get())) {
+                    //create the new trace node
+                    createNewTraceNode();
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+    private String extractClassName(MethodDeclaration md) {
+        // Get the file name from the compilation unit’s storage.
+        String fileName = md.findCompilationUnit()
+                .flatMap(cu -> cu.getStorage())
+                .map(storage -> storage.getFileName())
+                .orElse("UnknownClass");
+        // Remove the ".java" suffix if present
+        if (fileName.endsWith(".java")) {
+            return fileName.substring(0, fileName.length() - 5);
+        }
+        return fileName;
+    }
+
+    /**
+     * Creates a new TraceNode, which will be added as child to current.
+     * At the end of this method, the node including all its children are
+     * correctly set up without need for further processing.
+     */
+    private void createNewTraceNode() {
+        //create a new node and remove the token from the stack
+        int tokenValue = tokens.pop();
+        String traceID = String.valueOf(tokenValue);
+        int parentIndex = nodeList.indexOf(current);
+        TraceNode traceNode = new TraceNode(parentIndex, traceID);
+
+        //add the node to the list and it's index as child of current
+        nodeList.add(traceNode);
+        current.addChildIndex(nodeList.indexOf(traceNode));
+
+        //save the current state
+        current = traceNode;
+        Node tempNodeOfCurrent = nodeOfCurrent;
+        List<Range> tempRanges = methodCallRanges;
+        nodeOfCurrent = traceMap.get(tokenValue);
+
+        // 1) If this is a method node, fill in methodName + signature
+        if (nodeOfCurrent instanceof MethodDeclaration md) {
+            // --- the simple method name, e.g. "main", "doSomething" ---
+            traceNode.setNodeMethodName(md.getNameAsString());
+
+            // We'll try to form "packageName.ClassName" from the compilation unit:
+            //   e.g. "my.pkg" + "." + "SnowWhite"
+            // or fallback "SnowWhite" if no package
+            // or fallback "UnknownClass" if we cannot find anything
+            String fullyQualifiedClass = extractClassName(md);
+
+            // 2) Build the JVM descriptor for param types + return
+            StringBuilder paramBuf = new StringBuilder("(");
+            md.getParameters().forEach(p -> {
+                paramBuf.append(toJvmDescriptor(p.getType()));
+            });
+            paramBuf.append(")");
+            String returnDesc = toJvmDescriptor(md.getType());
+
+            // 3) Combine => "my.pkg.SnowWhite.methodName:([I)I"
+            String signature = fullyQualifiedClass
+                    + "."
+                    + md.getNameAsString()
+                    + ":"
+                    + paramBuf.toString()
+                    + returnDesc;
+
+            traceNode.setNodeMethodSignature(signature);
+        }
+        methodCallRanges = new ArrayList<>();
+
+        fillRanges((getBlockStmt() == null)
+                ? nodeOfCurrent.getChildNodes()
+                : getBlockStmt().getChildNodes(), null);
+
+        //if current node is a loop: calculate and set iteration
+        if (nodeOfCurrent instanceof NodeWithBody<?>) {
+            int iteration = 0;
+            for (int i : nodeList.get(current.getParentIndex()).getChildrenIndices()) {
+                if (nodeList.get(i).getTraceID().equals(current.getTraceID())) {
+                    iteration++;
+                }
+            }
+            current.setIteration(iteration);
+        }
+
+        if (jumpPackage != null && jumpPackage.isTarget(nodeOfCurrent)) {
+            //construct the out link
+            Path targetPath = nodeOfCurrent.findCompilationUnit().get()
+                    .getStorage().get().getPath();
+            targetPath = rootDir.relativize(targetPath);
+            JumpLink outLink = new JumpLink(jumpPackage.getJumpFrom(), targetPath.toString());
+
+            if (nodeOfCurrent instanceof MethodDeclaration) {
+
+                current.addOutLink(outLink);
+            }
+            if (nodeOfCurrent instanceof TryStmt) {
+                if (!tokens.empty()
+                        && nodeOfCurrent.getRange().get().contains(traceMap.get(tokens.peek()).getRange().get())) {
+                    nodeList.get(jumpPackage.getStart()).addOutLink(outLink);
+                    nodeList.get(jumpPackage.getStart()).setOut(nodeList.size());
+                    jumpPackage = null;
+                }
+            } else {
+                jumpPackage = null;
+            }
+        }
+
+        //if node was a loop, add the executed method calls from inside the loop to the
+        //executed calls of the previous node to prevent false positives in the
+        //deep search
+        if (nodeOfCurrent instanceof NodeWithBody<?>) {
+            tempRanges.addAll(methodCallRanges);
+            String loopLink;
+            if (nodeOfCurrent instanceof WhileStmt) {
+                loopLink = "while";
+            } else if (nodeOfCurrent instanceof DoStmt) {
+                loopLink = "do";
+            } else {
+                loopLink = "for";
+            }
+            Range linkRange = new Range(nodeOfCurrent.getBegin().get(),
+                    nodeOfCurrent.getBegin().get().right(loopLink.length() - 1));
+            JumpLink link = new JumpLink(linkRange, null);
+            current.setLink(link);
+        }
+
+        //restore state
+        current = nodeList.get(traceNode.getParentIndex());
+        nodeOfCurrent = tempNodeOfCurrent;
+        methodCallRanges = tempRanges;
+    }
+
+
+    /**
+     * Create a new trace node explicitly for a method call. For that the method
+     * first checks within what type of node the call is located to get the
+     * correct {@link MethodCallExpr} and then creates the node with the correct
+     * link and out-link for that expression.
+     *
+     * @return a boolean to indicate if current may have further children.
+     * True if the node was created, false otherwise.
+     */
+    private boolean createMethodCallTraceNode() {
+        MethodDeclaration node = (MethodDeclaration) traceMap.get(tokens.peek());
+        SimpleName nameOfDeclaration = node.getName();
+        SimpleName nameOfCall;
+
+
+        List<MethodCallExpr> callExprs = new ArrayList<>();
+
+        //if the current statement is a statement-block, search statements individually for calls
+        if (nodeOfCurrent instanceof NodeWithStatements<?> block) {
+            for (Statement statement : block.getStatements()) {
+                //exempt return statements without expression, break and
+                //continue statements from method call deep search
+                if (!(statement instanceof ReturnStmt ret && ret.getExpression().isEmpty())
+                        && !(statement instanceof BreakStmt)
+                        && !(statement instanceof ContinueStmt)) {
+                    List<MethodCallExpr> foundCalls = statement.findAll(MethodCallExpr.class,
+                            Node.TreeTraversal.POSTORDER);
+                    if (!foundCalls.isEmpty()) {
+                        callExprs.addAll(foundCalls);
+                    }
+                }
+            }
+        } else {
+            callExprs = nodeOfCurrent.findAll(MethodCallExpr.class, Node.TreeTraversal.POSTORDER);
+        }
+
+        for (MethodCallExpr expr : callExprs) {
+            if (isValidCall(expr, nameOfDeclaration)) {
+
+                methodCallRanges.add(expr.getRange().get());
+                nameOfCall = expr.getName();
+                createNewTraceNode();
+
+                //set link, out-link and index of out
+                int lastAddedIndex = current.getChildrenIndices()
+                        .get(current.getChildrenIndices().size() - 1);
+                TraceNode lastAdded = nodeList.get(lastAddedIndex);
+
+                //check if ranges are present, should always be true due to preprocessing
+                if (nameOfCall.getRange().isPresent()
+                        && nameOfDeclaration.getRange().isPresent()) {
+
+                    Path targetPath = traceMap.get(Integer.valueOf(lastAdded.getTraceID()))
+                            .findCompilationUnit().get().getStorage().get().getPath();
+                    targetPath = rootDir.relativize(targetPath);
+                    JumpLink link = new JumpLink(nameOfCall.getRange().get(), targetPath.toString());
+
+                    Path sourcePath = traceMap.get(Integer.valueOf(nodeList.get(lastAdded.getParentIndex())
+                                    .getTraceID()))
+                                    .findCompilationUnit().get().getStorage().get().getPath();
+
+                    sourcePath = rootDir.relativize(sourcePath);
+                    JumpLink outLink = new JumpLink(nameOfDeclaration.getRange().get(), sourcePath.toString());
+
+                    lastAdded.setLink(link);
+                    lastAdded.addOutLink(outLink);
+                }
+                lastAdded.setOut(lastAdded.getParentIndex());
+
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Advance through all parsable code of the current node and save ranges
+     * which are not turned into their own tracenodes in a list,
+     * while creating new child-tracenodes for specific codetypes.
+     *
+     * @param childrenOfCurrent the list of code blocks in the current node
+     * @param nextRangeToIgnore range of the next child tracenode, necessary in order to
+     *                          skip it while adding ranges
+     */
+    @SuppressWarnings("checkstyle:FinalParameters")
+    private void fillRanges(final List<Node> childrenOfCurrent, Range nextRangeToIgnore) {
+
+        boolean skipNext = false;
+
+        for (int i = 0; i < childrenOfCurrent.size();) {
+
+            Node currentNode = childrenOfCurrent.get(i);
+
+            //determine the range of the next child
+            if (nextRangeToIgnore == null) {
+                if (processChild()) {
+                    TraceNode nextChild = nodeList.get(Iterables.getLast(current.getChildrenIndices()));
+                    nextRangeToIgnore =
+                            (traceMap.get(Integer.parseInt(nextChild.getTraceID())) instanceof MethodDeclaration)
+                                    ? nextChild.getLink()
+                                    : traceMap.get(Integer.parseInt(nextChild.getTraceID())).getRange().get();
+                } else {
+                    nextRangeToIgnore = new Range(nodeOfCurrent.getRange().get().end.nextLine(),
+                            nodeOfCurrent.getRange().get().end.nextLine());
+                }
+            }
+
+            if (!skipNext) {
+                markStatementsInChild(currentNode, nextRangeToIgnore);
+            }
+
+            if (currentNode.getRange().get().contains(nextRangeToIgnore)) {
+                //current range is a child, let it resolve and wait for the next child
+                nextRangeToIgnore = null;
+                if ((traceMap.get(
+                        Integer.valueOf(nodeList.get(Iterables.getLast(current.getChildrenIndices())).getTraceID()))
+                        instanceof MethodDeclaration) && !current.getRanges().contains(currentNode.getRange().get())) {
+                    current.addRange(currentNode.getRange().get());
+                }
+                if (jumpPackage != null) {
+                    return;
+                }
+                skipNext = true;
+            } else {
+                //if the next child lies ahead, advance and save current range in ranges if
+                //the skip flag isn't set (i.e. the current range isn't a child)
+                if (skipNext) {
+                    skipNext = false;
+                } else {
+                    if (!current.getRanges().contains(currentNode.getRange().get())
+                            && !Stream.of(TracedCode.values()).map(TracedCode::getType)
+                            .toList().contains(currentNode.getClass())) {
+                        current.addRange(currentNode.getRange().get());
+
+                        if (checkForJumpOut(currentNode)) {
+                            return;
+                        }
+                    }
+                }
+                i++;
+            }
+        }
+
+        //if the current node is a forStmt, and it has iteration steps, add them to the ranges
+        if (nodeOfCurrent instanceof ForStmt forStmt) {
+            for (boolean cont = true; cont;) {
+                cont = processChild();
+            }
+            forStmt.getUpdate().forEach(node -> current.addRange(node.getRange().get()));
+        }
+    }
+
+    /**
+     * private method used by {@link #fillRanges} to determine whether the current statement
+     * is a child node in which certain codeblocks are always executed
+     * (like the condition in an if statement) in order to mark it.
+     *
+     * @param currentNode Node currently being analyzed
+     * @param ifCheck used to determine which elif in an elif cascade is executed so that the conditions up to that
+     *                elif can be backfilled into the parents ranges
+     */
+    private void markStatementsInChild(final Node currentNode, final Range ifCheck) {
+        if (currentNode instanceof IfStmt ifStmt) {
+            current.addRange(ifStmt.getCondition().getRange().get());
+            if (ifStmt.getRange().get().contains(ifCheck)) {
+                while (ifStmt.getElseStmt().isPresent() && ifStmt.getElseStmt().get().isIfStmt()
+                       && !ifStmt.getElseStmt().get().asIfStmt().getThenStmt().getRange().get().isAfter(ifCheck)) {
+                    ifStmt = ifStmt.getElseStmt().get().asIfStmt();
+                    if (ifStmt.getCondition().getRange().isPresent()) {
+                        current.addRange(ifStmt.getCondition().getRange().get());
+                    }
+                }
+            }
+        } else if (currentNode instanceof ForStmt forStmt) {
+            List<Node> inits = new ArrayList<>(forStmt.getInitialization());
+            inits.forEach(init -> current.addRange(init.getRange().get()));
+            if (forStmt.getCompare().isPresent()) {
+                current.addRange(forStmt.getCompare().get().getRange().get());
+            }
+        } else if (currentNode instanceof WhileStmt whileStmt) {
+            current.addRange(whileStmt.getCondition().getRange().get());
+        } else if (currentNode instanceof ForEachStmt forEachStmt) {
+            current.addRange(forEachStmt.getVariable().getRange().get());
+            current.addRange(forEachStmt.getIterable().getRange().get());
+        } else if (currentNode instanceof DoStmt doStmt) {
+            current.addRange(doStmt.getCondition().getRange().get());
+        } else if (currentNode instanceof TryStmt tryStmt) {
+            tryStmt.getResources().forEach(resource -> current.addRange(resource.getRange().get()));
+        } else if (currentNode instanceof SwitchStmt switchStmt) {
+            current.addRange(switchStmt.getSelector().getRange().get());
+        }
+    }
+
+    private boolean checkForJumpOut(final Node currentNode) {
+        if (currentNode instanceof ReturnStmt returnStmt) {
+            jumpPackage = new JumpPackage(List.of(MethodDeclaration.class),
+                    new Range(returnStmt.getBegin().get(),
+                            returnStmt.getBegin().get().right("return".length())),
+                    nodeList.indexOf(current));
+            return true;
+        } else if (currentNode instanceof ContinueStmt continueStmt) {
+            jumpPackage = new JumpPackage(List.of(ForStmt.class, WhileStmt.class,
+                    DoStmt.class, ForEachStmt.class),
+                    continueStmt.getRange().get(),
+                    nodeList.indexOf(current));
+            return true;
+        } else if (currentNode instanceof BreakStmt breakStmt) {
+            jumpPackage = new JumpPackage(List.of(ForStmt.class, WhileStmt.class,
+                    DoStmt.class, ForEachStmt.class, SwitchEntry.class),
+                    breakStmt.getRange().get(),
+                    nodeList.indexOf(current));
+            return true;
+        } else if (currentNode instanceof ThrowStmt throwStmt) {
+            jumpPackage = new JumpPackage(List.of(TryStmt.class),
+                    new Range(throwStmt.getBegin().get(),
+                            throwStmt.getBegin().get().right("throw".length())),
+                    nodeList.indexOf(current));
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Get the block-statement surrounding a call-expression.
+     * Should only be called from {@link #createMethodCallTraceNode()}.
+     *
+     * @return A {@link BlockStmt} within which the call for the current
+     * AST node is located, null if none is found.
+     */
+    private BlockStmt getBlockStmt() {
+        BlockStmt block = null;
+
+        //check if call is within a method
+        if (nodeOfCurrent instanceof NodeWithOptionalBlockStmt<?> method) {
+            if (method.getBody().isPresent()) {
+                block = method.getBody().get();
+            }
+        }
+
+        //check if call is in a statement, i.e. a then -or else clause
+        //or a finally-block
+        if (nodeOfCurrent instanceof Statement stmt) {
+            if (stmt instanceof BlockStmt b) {
+                block = b;
+            }
+        }
+
+        //check if call is in a loop
+        if (nodeOfCurrent instanceof NodeWithBody<?> loop) {
+            Statement body = loop.getBody();
+            if (body instanceof BlockStmt z) {
+                block = z;
+            }
+        }
+
+        //check if call is in a switch entry
+        if (nodeOfCurrent instanceof NodeWithStatements<?> switchCase) {
+            block = new BlockStmt();
+            NodeList<Statement> statements = switchCase.getStatements();
+            block.setStatements(statements);
+        }
+
+        //check if call is in a catch clause
+        if (nodeOfCurrent instanceof NodeWithBlockStmt<?> catchClause) {
+            block = catchClause.getBody();
+        }
+
+        if (nodeOfCurrent instanceof TryStmt tryStmt) {
+            block = tryStmt.getTryBlock();
+        }
+
+        return block;
+    }
+
+    private boolean isValidCall(final MethodCallExpr callExpr, final SimpleName name) {
+        return !methodCallRanges.contains(callExpr.getRange().get())
+                && callExpr.getName().equals(name);
+    }
+
+    /**
+     * Gets the nodes created by this preprocessor.
+     *
+     * @return A List containing the created {@link TraceNode}
+     * objects.
+     */
+    public List<TraceNode> getNodeList() {
+        return this.nodeList;
+    }
+
+    /**
+     * Convert the node list to a String representation.
+     *
+     * @return A String containing a representation of
+     * each node with the value for every field.
+     */
+    public String toString() {
+        StringBuilder builder = new StringBuilder();
+        for (TraceNode node : nodeList) {
+            nodeToString(builder, node);
+            builder.append("\n\n");
+        }
+        builder.delete(builder.length() - 2, builder.length() - 1);
+        return builder.toString();
+    }
+
+    /**
+     * Converts a given {@link TraceNode} to a string.
+     *
+     * @param builder used to convert the {@link TraceNode}
+     * @param node    The {@link TraceNode} to be converted
+     */
+    private void nodeToString(final StringBuilder builder, final TraceNode node) {
+        builder.append("TraceID: ").append(node.getTraceID())
+                .append("\nChildren: ").append(node.getChildrenIndices())
+                .append("\nRanges: ").append(node.getRanges())
+                .append("\nLink: ").append(node.getLink())
+                .append("\nOutlink: ").append(node.getOutLinks())
+                .append("\nOut: ").append(node.getOutIndex())
+                .append("\nParent: ").append(node.getParentIndex())
+                .append("\nIteration: ").append(node.getIteration());
+    }
+}
+===== ./prorunvis/instrument/Instrumenter.java =====
+package prorunvis.instrument;
+
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.utils.ProjectRoot;
+import prorunvis.trace.TraceVisitor;
+
+import java.io.*;
+import java.nio.file.Paths;
+import java.util.Map;
+
+public final class Instrumenter {
+
+    private static File traceFile;
+
+    private Instrumenter() {
+        throw new IllegalStateException("Class can not be instantiated");
+    }
+
+    public static void setupTrace(final File file) {
+        traceFile = file;
+        try {
+            File parent = traceFile.getParentFile();
+            if (parent != null && !parent.exists()) {
+                if (!parent.mkdirs()) {
+                    throw new IOException("Could not create directories for trace file: " + parent);
+                }
+            }
+
+            if (traceFile.exists() && !traceFile.delete()) {
+                throw new IOException("Could not delete existing trace file: " + traceFile);
+            }
+
+            if (!traceFile.createNewFile()) {
+                throw new IOException("Could not create new trace file: " + traceFile);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Error setting up trace file: " + e.getMessage(), e);
+        }
+    }
+
+    public static void saveInstrumented(final ProjectRoot pr, final String instrumentedOutPath) {
+        File instrumented = new File(instrumentedOutPath);
+        if (!instrumented.exists() && !instrumented.mkdirs()) {
+            throw new RuntimeException("Could not create instrumented output directory: " + instrumentedOutPath);
+        }
+
+        // Save all compilation units to the specified directory
+        pr.getSourceRoots().forEach(sr -> sr.saveAll(Paths.get(instrumentedOutPath)));
+
+        File proRunVisDir = new File(instrumented, "prorunvis");
+        if (!proRunVisDir.exists() && !proRunVisDir.mkdirs()) {
+            throw new RuntimeException("Could not create prorunvis directory: " + proRunVisDir);
+        }
+
+        File proRunVisClass = new File(proRunVisDir, "Trace.java");
+        if (proRunVisClass.exists() && !proRunVisClass.delete()) {
+            throw new RuntimeException("Could not delete existing Trace.java");
+        }
+
+        try {
+            if (!proRunVisClass.createNewFile()) {
+                throw new IOException("Could not create Trace.java file");
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Error creating Trace.java: " + e.getMessage(), e);
+        }
+
+        String content = "package prorunvis;\n" +
+                "import java.io.BufferedWriter;\n" +
+                "import java.io.FileWriter;\n" +
+                "import java.io.IOException;\n" +
+                "\n" +
+                "public final class Trace {\n" +
+                "    // These fields allow manual forcing of a trace\n" +
+                "    public static int[] trace = null;\n" +
+                "    public static int index = 0;\n" +
+                "\n" +
+                "    public static void next_elem(int num) {\n" +
+                "        if (trace != null && index < trace.length) {\n" +
+                "            num = trace[index];\n" +
+                "            index++;\n" +
+                "        }\n" +
+                "        try (BufferedWriter writer = new BufferedWriter(new FileWriter(\"Trace.tr\", true))) {\n" +
+                "            writer.write(\"\" + num + System.lineSeparator());\n" +
+                "        } catch (IOException e) {\n" +
+                "            throw new RuntimeException(e.getMessage());\n" +
+                "        }\n" +
+                "    }\n" +
+                "}\n";
+
+        try (BufferedWriter bf = new BufferedWriter(new FileWriter(proRunVisClass, false))) {
+            bf.write(content);
+        } catch (IOException e) {
+            throw new RuntimeException("Error writing Trace.java: " + e.getMessage(), e);
+        }
+    }
+
+    public static void run(final CompilationUnit cu, final Map<Integer, Node> map) {
+        new TraceVisitor().visit(cu, map);
+    }
+}===== ./prorunvis/preprocess/modifier/IfStatementPreprocessor.java =====
+package prorunvis.preprocess.modifier;
+
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.stmt.BlockStmt;
+import com.github.javaparser.ast.stmt.IfStmt;
+import com.github.javaparser.ast.visitor.ModifierVisitor;
+
+
+/**
+ * A Visitor used by {@link prorunvis.preprocess.Preprocessor}. It can be used to
+ * modify if-statements to follow common java conventions using curly braces.
+ */
+public class IfStatementPreprocessor extends ModifierVisitor<Void> {
+
+    /**
+     * Modify if-statements, if the then and/or else statement is a single statement
+     * by replacing it with an equivalent block statement.
+     */
+    @Override
+    public IfStmt visit(final IfStmt stmt, final Void arg) {
+        super.visit(stmt, arg);
+
+        //check and process then statement
+        if (!stmt.getThenStmt().isBlockStmt()) {
+            BlockStmt block = new BlockStmt(new NodeList<>(stmt.getThenStmt()));
+            block.setRange(stmt.getThenStmt().getRange().get());
+            stmt.setThenStmt(block);
+            block.getStatement(0).setParentNode(block);
+        }
+
+        //check and process else statement if one is present
+        if (stmt.getElseStmt().isPresent()) {
+            if (!stmt.getElseStmt().get().isBlockStmt()
+                && !stmt.getElseStmt().get().isIfStmt()) {
+                BlockStmt block = new BlockStmt(new NodeList<>(stmt.getElseStmt().get()));
+                block.setRange(stmt.getElseStmt().get().getRange().get());
+                stmt.setElseStmt(block);
+                block.getStatement(0).setParentNode(block);
+            }
+        }
+        return stmt;
+    }
+}
+===== ./prorunvis/preprocess/modifier/ForLoopPreprocessor.java =====
+package prorunvis.preprocess.modifier;
+
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.stmt.BlockStmt;
+import com.github.javaparser.ast.stmt.ForStmt;
+import com.github.javaparser.ast.visitor.ModifierVisitor;
+
+/**
+ * A Visitor used by {@link prorunvis.preprocess.Preprocessor}. It can be used to
+ * modify for loops to follow common java conventions using curly braces.
+ */
+public class ForLoopPreprocessor extends ModifierVisitor<Void> {
+
+    /**
+     * Modify for loop-statements, if the body statement is a single statement
+     * by replacing it with an equivalent block statement.
+     */
+    @Override
+    public ForStmt visit(final ForStmt stmt, final Void arg) {
+        super.visit(stmt, arg);
+
+        if (!stmt.getBody().isBlockStmt()) {
+            BlockStmt block = new BlockStmt(new NodeList<>(stmt.getBody()));
+            block.setRange(stmt.getBody().getRange().get());
+            stmt.setBody(block);
+            block.getStatement(0).setParentNode(block);
+        }
+        return stmt;
+    }
+}
+===== ./prorunvis/preprocess/modifier/WhileLoopPreprocessor.java =====
+package prorunvis.preprocess.modifier;
+
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.stmt.BlockStmt;
+import com.github.javaparser.ast.stmt.WhileStmt;
+import com.github.javaparser.ast.visitor.ModifierVisitor;
+
+/**
+ * A Visitor used by {@link prorunvis.preprocess.Preprocessor}. It can be used to
+ * modify while loops to follow common java conventions using curly braces.
+ */
+public class WhileLoopPreprocessor extends ModifierVisitor<Void> {
+
+    /**
+     * Modify while-statements, if the body statement is a single statement
+     * by replacing it with an equivalent block statement.
+     */
+    @Override
+    public WhileStmt visit(final WhileStmt stmt, final Void arg) {
+        super.visit(stmt, arg);
+
+        if (!stmt.getBody().isBlockStmt()) {
+            BlockStmt block = new BlockStmt(new NodeList<>(stmt.getBody()));
+            block.setRange(stmt.getBody().getRange().get());
+            stmt.setBody(block);
+            block.getStatement(0).setParentNode(block);
+        }
+        return stmt;
+    }
+}
+===== ./prorunvis/preprocess/modifier/DoLoopPreprocessor.java =====
+package prorunvis.preprocess.modifier;
+
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.stmt.BlockStmt;
+import com.github.javaparser.ast.stmt.DoStmt;
+import com.github.javaparser.ast.visitor.ModifierVisitor;
+
+/**
+ * A Visitor used by {@link prorunvis.preprocess.Preprocessor}. It can be used to
+ * modify do-while loops to follow common java conventions using curly braces.
+ */
+public class DoLoopPreprocessor extends ModifierVisitor<Void> {
+
+    /**
+     * Modify dowhile-statements, if the body statement is a single statement
+     * by replacing it with an equivalent block statement.
+     */
+    @Override
+    public DoStmt visit(final DoStmt stmt, final Void arg) {
+        super.visit(stmt, arg);
+
+        if (!stmt.getBody().isBlockStmt()) {
+            BlockStmt block = new BlockStmt(new NodeList<>(stmt.getBody()));
+            block.setRange(stmt.getBody().getRange().get());
+            stmt.setBody(block);
+            block.getStatement(0).setParentNode(block);
+        }
+
+        return stmt;
+    }
+}
+===== ./prorunvis/preprocess/Preprocessor.java =====
+package prorunvis.preprocess;
+
+import com.github.javaparser.ast.CompilationUnit;
+import prorunvis.preprocess.modifier.DoLoopPreprocessor;
+import prorunvis.preprocess.modifier.ForLoopPreprocessor;
+import prorunvis.preprocess.modifier.IfStatementPreprocessor;
+import prorunvis.preprocess.modifier.WhileLoopPreprocessor;
+
+/**
+ * A preprocessor preparing a {@link CompilationUnit} for tracing.
+ * The compilation unit is modified to follow common java conventions,
+ * making it easier for the tracing to
+ */
+public final class Preprocessor {
+
+    /**
+     * This constructor should not be called.
+     */
+    private Preprocessor() {
+        throw new IllegalStateException();
+    }
+
+    /**
+     * Preprocess a compilation unit to get a more uniform code following
+     * common java conventions for the tracing.
+     * @param cu The compilation unit to process.
+     */
+    public static void run(final CompilationUnit cu) {
+        new IfStatementPreprocessor().visit(cu, null);
+        new ForLoopPreprocessor().visit(cu, null);
+        new WhileLoopPreprocessor().visit(cu, null);
+        new DoLoopPreprocessor().visit(cu, null);
+    }
+}
+===== ./prorunvis/CompileAndRun.java =====
+package prorunvis;
+
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.MethodDeclaration;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * This utility class compiles and runs the instrumented code.
+ */
+public final class CompileAndRun {
+
+    private CompileAndRun() {
+        throw new IllegalStateException();
+    }
+
+    /**
+     * Compile and run the main class found in the provided compilation units.
+     * @param cus a List of CompilationUnit with possibly one having a main method
+     * @param instrumentedInPath path to instrumented source
+     * @param compiledOutPath where compiled classes go
+     * @throws IOException if compilation fails due to I/O
+     * @throws InterruptedException if process is interrupted
+     */
+    public static void run(final List<CompilationUnit> cus,
+                           final String instrumentedInPath, final String compiledOutPath)
+            throws IOException, InterruptedException {
+        File compiled = new File(compiledOutPath);
+        if (!compiled.exists() && !compiled.mkdirs()) {
+            throw new IOException("Failed to create compiled output directory: " + compiledOutPath);
+        }
+
+        // Find main class
+        List<CompilationUnit> mains = cus.stream()
+                .filter(cu -> cu.findFirst(MethodDeclaration.class,
+                        m -> m.getNameAsString().equals("main")).isPresent())
+                .toList();
+        if (mains.isEmpty()) {
+            throw new RuntimeException("No main method found in the instrumented code. Cannot run.");
+        }
+
+        CompilationUnit mainUnit = mains.get(0);
+        String fileName = mainUnit.getStorage().get().getFileName();
+        Path sourcePath = mainUnit.getStorage().get().getDirectory();
+
+        // Compile
+        File instrDir = new File(instrumentedInPath);
+        List<String> allJavaFiles = new ArrayList<>();
+
+        Files.walk(instrDir.toPath())
+                .filter(p -> p.toString().endsWith(".java"))
+                .forEach(p -> allJavaFiles.add(p.toAbsolutePath().toString()));
+
+        List<String> command = new ArrayList<>();
+        command.add("javac");
+        command.add("-g");  // Add this flag to preserve debug symbols (variable names, etc.)
+        command.add("-sourcepath");
+        command.add(instrumentedInPath);
+        command.add("-d");
+        command.add(compiledOutPath);
+        command.addAll(allJavaFiles);
+        ProcessBuilder compilePb = new ProcessBuilder(command);
+        Process compileProc = compilePb.start();
+        int compileExit = compileProc.waitFor();
+        if (compileExit != 0) {
+            String compileError = new BufferedReader(new InputStreamReader(compileProc.getErrorStream()))
+                    .lines().collect(Collectors.joining("\n"));
+            throw new InterruptedException("An error occurred during compilation.\n" + compileError);
+        }
+
+        System.out.println("Compilation succeeded with all .java files!");
+        // Derive the main class name
+        // Convert the path difference to a package name
+        String prefix = Paths.get(instrumentedInPath).toAbsolutePath().toString();
+        String fullPath = sourcePath.toAbsolutePath().toString();
+        String packageName = "";
+        if (fullPath.length() > prefix.length()) {
+            packageName = fullPath.substring(prefix.length())
+                    .replace(File.separatorChar, '.');
+            if (packageName.startsWith(".")) {
+                packageName = packageName.substring(1);
+            }
+        }
+        String mainClass = packageName.isEmpty() ? fileName.replace(".java", "") : packageName + "." + fileName.replace(".java", "");
+
+        // Run
+        ProcessBuilder runPb = new ProcessBuilder("java", "-cp", compiledOutPath, mainClass);
+        runPb.directory(new File(compiledOutPath));// Run from the instrumented directory
+        Process runProc = runPb.start();
+        System.out.println("Running: java -cp " + compiledOutPath + " " + mainClass);
+        int runExit = runProc.waitFor();
+        if (runExit != 0) {
+            String runError = new BufferedReader(new InputStreamReader(runProc.getErrorStream()))
+                    .lines().collect(Collectors.joining("\n"));
+            if (!runError.isEmpty()) {
+                System.out.println("There was an error running the input code.\n" + runError);
+            }
+        }
+    }
+}

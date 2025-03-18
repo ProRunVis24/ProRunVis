@@ -1,0 +1,2372 @@
+===== ./repository/TraceDataRepository.java =====
+package api.repository;
+
+import api.model.TraceData;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface TraceDataRepository extends JpaRepository<TraceData, Long> {
+}===== ./repository/ProcessedTraceRepository.java =====
+package api.repository;
+
+import api.model.ProcessedTrace;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface ProcessedTraceRepository extends JpaRepository<ProcessedTrace, Long> {
+}===== ./repository/InstrumentedCodeRepository.java =====
+package api.repository;
+
+import api.model.InstrumentedCode;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface InstrumentedCodeRepository extends JpaRepository<InstrumentedCode, Long> {
+}===== ./functionality/StaticMethodExtractorService.java =====
+package api.functionality;
+
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.utils.ProjectRoot;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import api.upload.storage.StorageProperties;
+import api.upload.storage.StorageService;
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+
+@Service
+public class StaticMethodExtractorService {
+
+    private final StorageService storageService;
+
+    public StaticMethodExtractorService(StorageService storageService) {
+        this.storageService = storageService;
+    }
+
+    public List<MethodInfo> extractMethods(String projectId) {
+        // Use the project-specific input location
+        String sourceLocation = storageService.getProjectInLocation(projectId);
+        File sourceDir = new File(sourceLocation);
+
+        if (!sourceDir.exists()) {
+            System.out.println("Source directory does not exist for project: " + projectId +
+                    " at: " + sourceLocation);
+            return new ArrayList<>();
+        }
+
+        // Configure JavaParser to use a symbol solver
+        StaticJavaParser.getParserConfiguration().setSymbolResolver(
+                new JavaSymbolSolver(new CombinedTypeSolver())
+        );
+        ProjectRoot projectRoot = new SymbolSolverCollectionStrategy().collect(sourceDir.toPath());
+        List<MethodInfo> methods = new ArrayList<>();
+
+        // Iterate over all source roots and parse them
+        projectRoot.getSourceRoots().forEach(sourceRoot -> {
+            try {
+                sourceRoot.tryToParse().forEach(cuResult -> {
+                    cuResult.getResult().ifPresent(cu -> {
+                        // For each method declaration found in the compilation unit, add its info
+                        cu.findAll(MethodDeclaration.class).forEach(md -> {
+                            String methodName = md.getNameAsString();
+                            String range = md.getRange().map(Object::toString).orElse("No Range");
+                            String file = cu.getStorage()
+                                    .map(storage -> storage.getPath().toString())
+                                    .orElse("Unknown File");
+                            methods.add(new MethodInfo(methodName, range, file));
+                        });
+                    });
+                });
+            } catch (IOException e) {
+                throw new RuntimeException("Error parsing source files for project: " + projectId, e);
+            }
+        });
+        return methods;
+    }
+
+    public String toJSON(String projectId) {
+        List<MethodInfo> methods = extractMethods(projectId);
+        Gson gson = new GsonBuilder().setPrettyPrinting().create();
+        return gson.toJson(methods);
+    }
+
+    // Inner class to represent method information
+    public static class MethodInfo {
+        private String methodName;
+        private String range; // Represented as a String for easy JSON serialization
+        private String file;
+
+        public MethodInfo(String methodName, String range, String file) {
+            this.methodName = methodName;
+            this.range = range;
+            this.file = file;
+        }
+
+        // Getters
+        public String getMethodName() {
+            return methodName;
+        }
+
+        public String getRange() {
+            return range;
+        }
+
+        public String getFile() {
+            return file;
+        }
+    }
+}===== ./functionality/process/ProcessingService.java =====
+package api.functionality.process;
+
+public interface ProcessingService {
+
+    /**
+     * Checks if data can be processed.
+     *
+     * @return true if data can be processed, false otherwise.
+     */
+    boolean isReady();
+
+    /**
+     * Instruments data by using the provided functions of
+     * the ProRunVis library.
+     */
+    void instrument();
+
+    /**
+     * Traces code by using provided functions of the
+     * ProRunVis library.
+     */
+    void trace();
+
+    /**
+     * Processes the traced data by using provided
+     * functions of the ProRunVis library.
+     */
+    void process();
+
+    /**
+     * Converts a processed trace to a JSON representation.
+     *
+     * @return A String containing the JSON representation.
+     */
+    String toJSON();
+}
+===== ./functionality/process/SingleRunProcessingService.java =====
+package api.functionality.process;
+
+import api.upload.storage.StorageProperties;
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
+import com.github.javaparser.utils.ProjectRoot;
+import com.google.gson.Gson;
+import org.springframework.stereotype.Service;
+import prorunvis.CompileAndRun;
+import prorunvis.instrument.Instrumenter;
+import prorunvis.preprocess.Preprocessor;
+import prorunvis.trace.TraceNode;
+import prorunvis.trace.process.TraceProcessor;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+
+@Service
+public final class SingleRunProcessingService implements ProcessingService {
+
+    /**
+     * The location where input data is stored.
+     */
+    private final Path inLocation;
+
+    /**
+     * The location for storing temporary output data.
+     */
+    private final Path outLocation;
+
+    /**
+     * A List of {@link CompilationUnit}s.
+     */
+    private List<CompilationUnit> cus;
+
+    /**
+     * A File containing the trace of a program run.
+     */
+    private File traceFile;
+
+    /**
+     * A HashMap containing {@link Node} objects mapped to
+     * their trace IDs.
+     */
+    private HashMap<Integer, Node> traceMap;
+
+    /**
+     * A List of {@link TraceNode} objects as provided by the
+     * {@link TraceProcessor} of the ProRunVis library.
+     */
+    private List<TraceNode> nodes;
+
+    /**
+     * Constructs a ProcessingService for processing a single program
+     * run.
+     *
+     * @param properties The StorageProperties for input and output
+     *                   locations.
+     */
+    public SingleRunProcessingService(final StorageProperties properties) {
+        if (properties.getLocation().trim().isEmpty()) {
+            throw new ProcessingException("Cannot process empty directory.");
+        }
+
+        inLocation = Paths.get(properties.getLocation());
+        outLocation = Paths.get(properties.getOutLocation());
+    }
+    @Override
+    public boolean isReady() {
+        return inLocation.toFile().exists()
+                && inLocation.toFile().isDirectory()
+                && Objects.requireNonNull(inLocation.toFile().listFiles()).length > 0;
+    }
+
+    @Override
+    public void instrument() {
+        //setup parser and trace file
+        StaticJavaParser.getParserConfiguration().setSymbolResolver(new JavaSymbolSolver(new CombinedTypeSolver()));
+        ProjectRoot projectRoot =
+                new SymbolSolverCollectionStrategy().collect(inLocation);
+
+        traceFile = new File(outLocation.toString() + "/Trace.tr");
+        Instrumenter.setupTrace(traceFile);
+
+        //run parser and collect compilation units
+        cus = new ArrayList<>();
+        projectRoot.getSourceRoots().forEach(sr -> {
+            try {
+                sr.tryToParse().forEach(cu -> cus.add(cu.getResult().orElseThrow()));
+            } catch (IOException | NoSuchElementException e) {
+                throw new ProcessingException("Cannot parse provided input.", e);
+            }
+        });
+
+        traceMap = new HashMap<>();
+        cus.forEach(cu -> {
+            Preprocessor.run(cu);
+            Instrumenter.run(cu, traceMap);
+        });
+        Instrumenter.saveInstrumented(projectRoot, outLocation.toString() + "/instrumented");
+    }
+
+    @Override
+    public void trace() {
+        try {
+            CompileAndRun.run(cus, outLocation.toString() + "/instrumented",
+                    outLocation.toString() + "/compiled");
+        } catch (IOException | InterruptedException | ArrayIndexOutOfBoundsException e) {
+            throw new ProcessingException(e.getMessage());
+        }
+    }
+
+    @Override
+    public void process() {
+        TraceProcessor processor = new TraceProcessor(traceMap, traceFile.getPath(), inLocation);
+        try {
+            processor.start();
+        } catch (IOException e) {
+            throw new ProcessingException("An error occurred during processing of the trace.", e);
+        }
+        nodes = processor.getNodeList();
+    }
+
+    @Override
+    public String toJSON() {
+        Gson gson = new Gson();
+        String response = gson.toJson(nodes);
+        //replace \\ from windows paths with / for webkit directory
+        return response.replace("\\\\", "/");
+    }
+}
+===== ./functionality/process/ProcessingException.java =====
+package api.functionality.process;
+
+public class ProcessingException extends RuntimeException {
+
+    public ProcessingException(final String message) {
+        super(message);
+    }
+
+    public ProcessingException(final String message, final Throwable cause) {
+        super(message, cause);
+    }
+}
+===== ./controller/JBMCController.java =====
+package api.controller;
+
+import api.service.JBMCService;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/jbmc")
+public class JBMCController {
+
+    private final JBMCService jbmcService;
+
+    public JBMCController(JBMCService jbmcService) {
+        this.jbmcService = jbmcService;
+    }
+
+    /**
+     * POST /api/jbmc/run?instrumentId=<localId>&methodSignature=<sig>&unwind=5&maxArray=5&projectId=<projectId>
+     * This triggers JBMC to run for that localId's compiled code.
+     */
+    @PostMapping("/run")
+    public ResponseEntity<String> runJBMC(
+            @RequestParam("instrumentId") String instrumentId,
+            @RequestParam("methodSignature") String methodSignature,
+            @RequestParam(name = "unwind", defaultValue = "5") int unwind,
+            @RequestParam(name = "maxArray", defaultValue = "5") int maxArray,
+            @RequestParam String projectId) {
+
+        if (projectId == null || projectId.isEmpty()) {
+            return ResponseEntity.badRequest().body("No project ID provided. Please specify a project ID.");
+        }
+
+        jbmcService.runJBMC(instrumentId, methodSignature, unwind, maxArray, projectId);
+        return ResponseEntity.ok("JBMC run complete. JSON stored in local_storage/project-" + projectId + "/" + instrumentId + "/jbmcOutput.json");
+    }
+
+    /**
+     * GET /api/jbmc/result/<instrumentId>?projectId=<projectId>
+     * Returns the raw JSON from JBMC's last run for that localId.
+     */
+    @GetMapping(value = "/result/{instrumentId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<String> getJBMCResult(
+            @PathVariable String instrumentId,
+            @RequestParam String projectId) {
+
+        if (projectId == null || projectId.isEmpty()) {
+            return ResponseEntity.badRequest().body("No project ID provided. Please specify a project ID.");
+        }
+
+        String jbmcJson = jbmcService.getJBMCOutput(instrumentId, projectId);
+        return ResponseEntity.ok(jbmcJson);
+    }
+}===== ./controller/VisualizationController.java =====
+package api.controller;
+
+import api.service.VisualizationService;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.RequestParam;
+
+/**
+ * Returns JSON from the processedTrace.json file in local_storage/project-<projectId>/<localId>.
+ */
+@RestController
+@RequestMapping("/api/visualize")
+public class VisualizationController {
+
+    private final VisualizationService service;
+    private final ObjectMapper objectMapper;
+
+    public VisualizationController(VisualizationService service) {
+        this.service = service;
+        this.objectMapper = new ObjectMapper();
+    }
+
+    /**
+     * We pass a local ID referencing the folder with processedTrace.json.
+     *
+     * 1) We read the raw JSON string from VisualizationService.
+     * 2) Parse it into an Object so Spring can produce real JSON with correct Content-Type.
+     */
+    @GetMapping(value = "/{localId}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<Object> getTraceJson(
+            @PathVariable String localId,
+            @RequestParam String projectId) {
+
+        if (projectId == null || projectId.isEmpty()) {
+            return ResponseEntity.badRequest().body("No project ID provided. Please specify a project ID.");
+        }
+
+        String rawJson = service.getTraceJson(localId, projectId);
+        try {
+            // Convert the raw JSON string to a generic Object
+            Object jsonObj = objectMapper.readValue(rawJson, Object.class);
+            // Return as JSON, 200 OK
+            return ResponseEntity.ok(jsonObj);
+        } catch (Exception e) {
+            // If parse fails or file is invalid, return 500
+            return ResponseEntity
+                    .status(500)
+                    .body("Failed to parse processedTrace.json: " + e.getMessage());
+        }
+    }
+}===== ./controller/TraceController.java =====
+package api.controller;
+
+import api.service.TracingService;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/trace")
+public class TraceController {
+
+    private final TracingService service;
+
+    public TraceController(TracingService service) {
+        this.service = service;
+    }
+
+    /**
+     * POST /api/trace?instrumentId=<localId>&projectId=<projectId>
+     * Runs the trace process for the given localId and projectId.
+     */
+    @PostMapping
+    public String runTrace(
+            @RequestParam String instrumentId,
+            @RequestParam String projectId) {
+
+        if (projectId == null || projectId.isEmpty()) {
+            throw new RuntimeException("No project ID provided. Please specify a project ID.");
+        }
+
+        // Run the trace with both instrumentId and projectId
+        service.runTrace(instrumentId, projectId);
+
+        // Return the instrument ID for the next step
+        return instrumentId;
+    }
+}===== ./controller/VarMappingController.java =====
+package api.controller;
+
+import api.service.VariableNameMapper;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/varMapping")
+public class VarMappingController {
+
+    /**
+     * Given a file name and line number, returns a list of variable names
+     * declared on that line. For example, if the file "MyClass.java" has two
+     * variables declared on line 15, this endpoint returns them.
+     *
+     * URL example: GET /api/varMapping?file=MyClass.java&line=15&projectId=<projectId>
+     */
+    @GetMapping
+    public ResponseEntity<List<String>> getVariables(
+            @RequestParam String file,
+            @RequestParam int line,
+            @RequestParam String projectId) {
+
+        if (projectId == null || projectId.isEmpty()) {
+            return ResponseEntity.badRequest()
+                    .body(Collections.emptyList());
+        }
+
+        VariableNameMapper mapper = new VariableNameMapper();
+        try {
+            // Build the mapping from the project-specific source directory
+            mapper.buildVarNameMapping(Paths.get("resources/in/project-" + projectId));
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Collections.emptyList());
+        }
+
+        Map<String, Map<Integer, List<String>>> varDeclMap = mapper.getVarDeclMap();
+        // Extract only the simple file name
+        String simpleFile = new File(file).getName();
+        Map<Integer, List<String>> fileMapping = varDeclMap.get(simpleFile);
+        List<String> variables = (fileMapping != null) ? fileMapping.get(line) : null;
+        if (variables == null) {
+            variables = Collections.emptyList();
+        }
+        return ResponseEntity.ok(variables);
+    }
+}===== ./controller/ProcessController.java =====
+package api.controller;
+
+import api.service.ProcessingService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/process")
+public class ProcessController {
+
+    private final ProcessingService processingService;
+
+    public ProcessController(ProcessingService processingService) {
+        this.processingService = processingService;
+    }
+
+    /**
+     * POST /api/process?traceId=<shortId>&projectId=<projectId>
+     *
+     * We'll read local_storage/project-<projectId>/<shortId>/Trace.tr,
+     * produce processedTrace.json, store it in the same folder,
+     * and return the shortId (or path) for the next step.
+     */
+    @PostMapping
+    public String processTrace(
+            @RequestParam String traceId,
+            @RequestParam String projectId) {
+
+        if (projectId == null || projectId.isEmpty()) {
+            throw new RuntimeException("No project ID provided. Please specify a project ID.");
+        }
+
+        // run the processing with project ID
+        processingService.processTrace(traceId, projectId);
+
+        // return the same short ID for the front end
+        // so the front end can do a GET /api/visualize/<traceId> if desired
+        return traceId;
+    }
+}===== ./controller/ProjectController.java =====
+package api.controller;
+
+import api.upload.storage.StorageService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.ResponseBody;
+import org.springframework.web.bind.annotation.RequestParam;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.util.Date;
+import java.util.UUID;
+
+@Controller
+public class ProjectController {
+
+    private final StorageService storageService;
+
+    @Autowired
+    public ProjectController(StorageService storageService) {
+        this.storageService = storageService;
+    }
+
+    /**
+     * Creates a brand new project and redirects to the home page.
+     * Use this to force a new project in a new tab.
+     */
+    @GetMapping("/new-project")
+    public String newProject(HttpServletResponse response) {
+        // Create a unique project ID
+        String projectId = UUID.randomUUID().toString().substring(0, 8);
+
+        // Initialize storage for this new project
+        storageService.initProject(projectId);
+
+        // Disable caching to ensure we always get a fresh page
+        response.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        response.setHeader("Pragma", "no-cache");
+        response.setHeader("Expires", "0");
+
+        System.out.println("Created new project with project ID: " + projectId);
+
+        return "redirect:/?projectId=" + projectId;
+    }
+
+    /**
+     * Debug endpoint to check project information.
+     */
+    @GetMapping("/debug/project")
+    @ResponseBody
+    public String debugProject(@RequestParam(required = false) String projectId) {
+        if (projectId == null || projectId.isEmpty()) {
+            return "No project ID provided";
+        }
+
+        StringBuilder debug = new StringBuilder();
+        debug.append("Project ID: ").append(projectId).append("<br>");
+        debug.append("Input Directory: ").append(storageService.getProjectInLocation(projectId)).append("<br>");
+        debug.append("Output Directory: ").append(storageService.getProjectOutLocation(projectId)).append("<br>");
+        debug.append("Local Storage: ").append(storageService.getProjectLocalStorageLocation(projectId)).append("<br>");
+
+        return debug.toString();
+    }
+}===== ./controller/InstrumentController.java =====
+// InstrumentController.java
+package api.controller;
+
+import api.service.InstrumentationService;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/instrument")
+public class InstrumentController {
+    private final InstrumentationService service;
+
+    public InstrumentController(InstrumentationService service) {
+        this.service = service;
+    }
+
+    /**
+     * POST /api/instrument?projectName=<name>&inputDir=[optional]&projectId=<projectId>
+     * Instruments a project using project-based file storage.
+     */
+    @PostMapping
+    public String instrumentProject(
+            @RequestParam String projectName,
+            @RequestParam(required = false) String inputDir,
+            @RequestParam String projectId
+    ) {
+        if (projectId == null || projectId.isEmpty()) {
+            throw new RuntimeException("No project ID provided. Please specify a project ID.");
+        }
+        if (inputDir == null || inputDir.isEmpty()) {
+            inputDir = "resources/in/project-" + projectId;
+        }
+        String localId = UUID.randomUUID().toString();
+        service.instrumentProject(projectName, inputDir, localId, projectId);
+        return localId;
+    }
+}===== ./controller/StaticMethodController.java =====
+package api.controller;
+
+import api.functionality.StaticMethodExtractorService;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.RequestParam;
+
+@RestController
+public class StaticMethodController {
+
+    private final StaticMethodExtractorService extractorService;
+
+    @Autowired
+    public StaticMethodController(StaticMethodExtractorService extractorService) {
+        this.extractorService = extractorService;
+    }
+
+    // Expose an endpoint that returns the static methods JSON
+    @GetMapping("/api/static-methods")
+    public String getStaticMethods(@RequestParam String projectId) {
+        if (projectId == null || projectId.isEmpty()) {
+            throw new RuntimeException("No project ID provided. Please specify a project ID.");
+        }
+
+        return extractorService.toJSON(projectId);
+    }
+}===== ./controller/JBMCFlattenController.java =====
+package api.controller;
+
+import api.service.JBMCFlattenService;
+import api.service.ProcessingService;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+import java.util.logging.Logger;
+
+@RestController
+@RequestMapping("/api/jbmc/flatten")
+public class JBMCFlattenController {
+
+    private static final Logger logger = Logger.getLogger(JBMCFlattenController.class.getName());
+
+    private final ProcessingService processingService;
+    private final JBMCFlattenService flattenService;
+
+    public JBMCFlattenController(ProcessingService processingService,
+                                 JBMCFlattenService flattenService) {
+        this.processingService = processingService;
+        this.flattenService = flattenService;
+    }
+
+    /**
+     * GET /api/jbmc/flatten?projectId=<projectId>
+     * Returns an array of FlattenedAssignment objects in JSON.
+     */
+    @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<?> getFlattenedAssignments(@RequestParam String projectId) {
+        logger.info("Received request for flattened JBMC assignments for project: " + projectId);
+
+        if (projectId == null || projectId.isEmpty()) {
+            logger.warning("No project ID provided.");
+            return ResponseEntity.badRequest().body("No project ID provided. Please specify a project ID.");
+        }
+
+        // 1) Grab the last processed nodes from memory for this project
+        var nodeList = processingService.getLastProcessedNodes(projectId);
+        if (nodeList == null || nodeList.isEmpty()) {
+            logger.warning("No in-memory trace data found for project: " + projectId + ". Did you run /api/process yet?");
+            return ResponseEntity.badRequest().body("No in-memory trace data found. Did you run /api/process yet?");
+        }
+        logger.info("Retrieved " + nodeList.size() + " processed trace nodes from memory for project: " + projectId);
+
+        // 2) Flatten them
+        List<JBMCFlattenService.FlattenedAssignment> flattened;
+        try {
+            flattened = flattenService.flatten(nodeList);
+            logger.info("Successfully flattened assignments. Total flattened assignments: " + flattened.size());
+        } catch (Exception e) {
+            logger.severe("Error flattening JBMC assignments: " + e.getMessage());
+            return ResponseEntity.status(500).body("Error flattening JBMC assignments: " + e.getMessage());
+        }
+
+        // 3) Return as JSON
+        logger.info("Returning flattened JBMC assignments as JSON for project: " + projectId);
+        return ResponseEntity.ok(flattened);
+    }
+}===== ./model/ProcessedTrace.java =====
+package api.model;
+
+import jakarta.persistence.*;
+
+@Entity
+public class ProcessedTrace {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private Long traceDataId;
+
+    @Lob
+    private String processedJson;
+
+    public Long getId() {
+        return id;
+    }
+
+    public Long getTraceDataId() {
+        return traceDataId;
+    }
+
+    public String getProcessedJson() {
+        return processedJson;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public void setTraceDataId(Long traceDataId) {
+        this.traceDataId = traceDataId;
+    }
+
+    public void setProcessedJson(String processedJson) {
+        this.processedJson = processedJson;
+    }
+}
+===== ./model/InstrumentedCode.java =====
+package api.model;
+
+import jakarta.persistence.*;
+
+@Entity
+public class InstrumentedCode {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String projectName;
+
+    @Lob
+    private String instrumentedSourceZip;
+
+    @Lob
+    private String nodeMapJson;
+
+    public Long getId() {
+        return id;
+    }
+
+    public String getProjectName() {
+        return projectName;
+    }
+
+    public String getInstrumentedSourceZip() {
+        return instrumentedSourceZip;
+    }
+
+    public String getNodeMapJson() {
+        return nodeMapJson;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public void setProjectName(String projectName) {
+        this.projectName = projectName;
+    }
+
+    public void setInstrumentedSourceZip(String instrumentedSourceZip) {
+        this.instrumentedSourceZip = instrumentedSourceZip;
+    }
+
+    public void setNodeMapJson(String nodeMapJson) {
+        this.nodeMapJson = nodeMapJson;
+    }
+}
+===== ./model/TraceData.java =====
+package api.model;
+
+import jakarta.persistence.*;
+
+@Entity
+public class TraceData {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private Long instrumentedCodeId;
+
+    @Lob
+    private String traceFileContent;
+
+    public Long getId() {
+        return id;
+    }
+
+    public Long getInstrumentedCodeId() {
+        return instrumentedCodeId;
+    }
+
+    public String getTraceFileContent() {
+        return traceFileContent;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public void setInstrumentedCodeId(Long instrumentedCodeId) {
+        this.instrumentedCodeId = instrumentedCodeId;
+    }
+
+    public void setTraceFileContent(String traceFileContent) {
+        this.traceFileContent = traceFileContent;
+    }
+}
+===== ./service/TracingService.java =====
+package api.service;
+
+import com.github.javaparser.ast.CompilationUnit;
+import org.springframework.stereotype.Service;
+import prorunvis.CompileAndRun;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.List;
+
+/**
+ * This service:
+ *  1) Reads base64-encoded instrumented code from
+ *     resources/local_storage/project-<projectId>/<instrumentId>/instrumented_base64.txt
+ *  2) Decodes/unzips into resources/out/project-<projectId>/downloaded_instrumented
+ *  3) Compiles and runs the code => Trace.tr
+ *  4) Copies Trace.tr into local_storage/project-<projectId>/<instrumentId>/Trace.tr
+ */
+@Service
+public class TracingService {
+
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    public TracingService() {
+        // no DB repos needed
+    }
+
+    /**
+     * Clears out resources/out/project-<projectId> to ensure a fresh decode/unzip + compile/run.
+     */
+    private void cleanOutputDirectories(String projectId) {
+        File outDir = new File("resources/out/project-" + projectId);
+        if (outDir.exists()) {
+            try {
+                org.springframework.util.FileSystemUtils.deleteRecursively(outDir.toPath());
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to clean output directories for project: " + projectId, e);
+            }
+        }
+        if (!outDir.mkdirs()) {
+            throw new RuntimeException("Failed to create output directory after cleaning for project: " + projectId);
+        }
+    }
+
+    /**
+     * Decode, compile, run, produce Trace.tr inside local_storage/project-<projectId>/<instrumentId>.
+     */
+    public void runTrace(String instrumentId, String projectId) {
+        // local_storage/project-<projectId>/<instrumentId>
+        File localIdFolder = new File(LOCAL_STORAGE_DIR + "/project-" + projectId, instrumentId);
+        if (!localIdFolder.exists() || !localIdFolder.isDirectory()) {
+            throw new RuntimeException("Local ID folder does not exist: " + localIdFolder.getAbsolutePath());
+        }
+
+        // local_storage/project-<projectId>/<instrumentId>/instrumented_base64.txt
+        File base64File = new File(localIdFolder, "instrumented_base64.txt");
+        if (!base64File.exists()) {
+            throw new RuntimeException("No instrumented_base64.txt found for ID: " + instrumentId + " in project: " + projectId);
+        }
+
+        // 1) Read the base64 content
+        String base64 = Util.readFileAsString(base64File);
+
+        // 2) decode/unzip into resources/out/project-<projectId>/downloaded_instrumented
+        cleanOutputDirectories(projectId);
+        String projectOutDir = "resources/out/project-" + projectId;
+        File instrumentedDir = Util.unzipAndDecode(base64, projectOutDir);
+
+        // 3) compile + run
+        List<CompilationUnit> cus = Util.loadCUs(instrumentedDir);
+        try {
+            CompileAndRun.run(
+                    cus,
+                    instrumentedDir.getAbsolutePath(),
+                    instrumentedDir.getAbsolutePath() + "/compiled"
+            );
+        } catch (Exception e) {
+            throw new RuntimeException("Trace run failed for project: " + projectId, e);
+        }
+
+        // 4) check for Trace.tr INSIDE THE "compiled" SUBFOLDER
+        File compiledFolder = new File(instrumentedDir, "compiled");
+        File traceFile = new File(compiledFolder, "Trace.tr");
+
+        if (!traceFile.exists()) {
+            throw new RuntimeException(
+                    "No Trace.tr found in: " + compiledFolder.getAbsolutePath());
+        }
+        System.out.println("Trace file generated at: " + traceFile.getAbsolutePath() + " for project: " + projectId);
+
+        // 5) copy Trace.tr → local_storage/project-<projectId>/<instrumentId>/Trace.tr
+        File localTrace = new File(localIdFolder, "Trace.tr");
+        try {
+            Files.copy(
+                    traceFile.toPath(),
+                    localTrace.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING
+            );
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "Failed copying Trace.tr to: " + localTrace.getAbsolutePath() + " for project: " + projectId,
+                    e
+            );
+        }
+    }
+}===== ./service/ProcessingService.java =====
+package api.service;
+
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.utils.ProjectRoot;
+import com.google.gson.Gson;
+import org.springframework.stereotype.Service;
+import prorunvis.trace.TraceNode;
+import prorunvis.trace.process.TraceProcessor;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Service
+public class ProcessingService {
+
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    // Store the processed nodes per project
+    private final Map<String, List<TraceNode>> projectProcessedNodes = new ConcurrentHashMap<>();
+
+    public void processTrace(String traceId, String projectId) {
+        System.out.println("[processTrace] Starting process for traceId = " + traceId + ", projectId = " + projectId);
+
+        // 1) local_storage/project-<projectId>/<traceId> must exist
+        File localIdFolder = new File(LOCAL_STORAGE_DIR + "/project-" + projectId, traceId);
+        if (!localIdFolder.exists() || !localIdFolder.isDirectory()) {
+            throw new RuntimeException("Local ID folder does not exist: " + localIdFolder.getAbsolutePath() + " for project: " + projectId);
+        }
+
+        // 2) local_storage/project-<projectId>/<traceId>/Trace.tr must exist
+        File traceFile = new File(localIdFolder, "Trace.tr");
+        if (!traceFile.exists()) {
+            throw new RuntimeException("Trace file not found: " + traceFile.getAbsolutePath() + " for project: " + projectId);
+        }
+
+        // 3) Re-parse code from project-specific input directory
+        Path codeRoot = Paths.get("resources/in/project-" + projectId);
+        System.out.println("[processTrace] Parsing project from: " + codeRoot.toAbsolutePath() + " for project: " + projectId);
+        ProjectRoot projectRoot = Util.parseProject(codeRoot.toFile());
+        List<CompilationUnit> cus = Util.getCUs(projectRoot);
+
+        // 4) Build the map of AST nodes
+        Map<Integer, Node> map = new HashMap<>();
+        for (CompilationUnit cu : cus) {
+            // Preprocess & Instrument
+            prorunvis.preprocess.Preprocessor.run(cu);
+            prorunvis.instrument.Instrumenter.run(cu, map);
+        }
+
+        // 5) Construct the TraceProcessor
+        TraceProcessor processor = new TraceProcessor(map, traceFile.getAbsolutePath(), codeRoot);
+        try {
+            processor.start();
+        } catch (Exception e) {
+            throw new RuntimeException("Processing failed for project: " + projectId + ", error: " + e.getMessage(), e);
+        }
+
+        // 6) Get trace nodes
+        List<TraceNode> nodeList = processor.getNodeList();
+
+        // Store in project-specific memory
+        projectProcessedNodes.put(projectId, nodeList);
+
+        System.out.println("[processTrace] Found " + nodeList.size() + " trace nodes for project: " + projectId);
+
+        // 7) Merge JBMC data (including bridging variable names)
+        mergeJBMCValues(traceId, nodeList, projectId);
+
+        // 8) Write processedTrace.json to project-specific folder
+        File outputJson = new File(localIdFolder, "processedTrace.json");
+        String json = new Gson().toJson(nodeList);
+        try (FileOutputStream fos = new FileOutputStream(outputJson)) {
+            fos.write(json.getBytes());
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write processedTrace.json at: " + outputJson.getAbsolutePath() +
+                    " for project: " + projectId, e);
+        }
+        System.out.println("[processTrace] Completed. JSON at: " + outputJson.getAbsolutePath() + " for project: " + projectId);
+    }
+
+    /**
+     * Returns the in-memory list of TraceNodes from the last processing step for a specific project.
+     */
+    public List<TraceNode> getLastProcessedNodes(String projectId) {
+        return projectProcessedNodes.getOrDefault(projectId, Collections.emptyList());
+    }
+
+    /**
+     * Reads jbmcOutput.json from the project-specific folder and merges JBMC values
+     * into the trace nodes.
+     */
+    public void mergeJBMCValues(String traceId, List<TraceNode> nodeList, String projectId) {
+        File localFolder = new File(LOCAL_STORAGE_DIR + "/project-" + projectId, traceId);
+        File jbmcFile = new File(localFolder, "jbmcOutput.json");
+        if (!jbmcFile.exists()) {
+            System.out.println("[mergeJBMCValues] No jbmcOutput.json for " + traceId + " in project: " + projectId + ". Skipping.");
+            return;
+        }
+
+        String jbmcJson;
+        try {
+            jbmcJson = java.nio.file.Files.readString(jbmcFile.toPath());
+        } catch (IOException e) {
+            throw new RuntimeException("Could not read jbmcOutput.json for " + traceId + " in project: " + projectId, e);
+        }
+
+        List<JBMCParser.VarAssignment> assignments = JBMCParser.parseVariableAssignments(jbmcJson);
+        System.out.println("[mergeJBMCValues] Found " + assignments.size() + " JBMC assignments for project: " + projectId);
+
+        // Build a map of (file, line) -> declared variable name(s) from project-specific user code
+        VariableNameMapper varMapper = new VariableNameMapper();
+        try {
+            varMapper.buildVarNameMapping(Paths.get("resources/in/project-" + projectId));
+        } catch (IOException e) {
+            throw new RuntimeException("Failed building variable name map from user code for project: " + projectId, e);
+        }
+        Map<String, Map<Integer, List<String>>> varDeclMap = varMapper.getVarDeclMap();
+        System.out.println("[mergeJBMCValues] Built variable decl map with " + varDeclMap.size() +
+                " files for project: " + projectId);
+
+        int totalMatches = 0;
+
+        for (JBMCParser.VarAssignment va : assignments) {
+            // Map JBMC variable name to the declared source-level name, if available
+            String realVarName = va.variableName;
+            if (va.file != null && !va.file.isEmpty() && va.line > 0) {
+                String fileKey = new File(va.file).getName();  // Normalize file name
+                if (varDeclMap.containsKey(fileKey)) {
+                    Map<Integer, List<String>> lineMap = varDeclMap.get(fileKey);
+                    if (lineMap.containsKey(va.line)) {
+                        List<String> declaredVars = lineMap.get(va.line);
+                        if (!declaredVars.isEmpty()) {
+                            realVarName = declaredVars.get(0);
+                        }
+                    }
+                }
+            }
+
+            System.out.println("[mergeJBMCValues] For project: " + projectId +
+                    ", mapping assignment: JBMC variable '" + va.variableName +
+                    "' mapped to real variable '" + realVarName + "'");
+
+            boolean foundTraceNode = false;
+            for (TraceNode node : nodeList) {
+                if (node.getLink() == null) continue;
+                String nodeFilePath = node.getLink().getFilepath();
+                // Compare normalized file names
+                if (nodeFilePath != null && nodeFilePath.endsWith(new File(va.file).getName())) {
+                    boolean matchedRange = node.getRanges().stream().anyMatch(r ->
+                            (r.begin.line <= va.line && va.line <= r.end.line));
+                    if (matchedRange) {
+                        if (node.getJbmcValues() == null) {
+                            node.setJbmcValues(new HashMap<>());
+                        }
+                        node.getJbmcValues().computeIfAbsent(realVarName, k -> new ArrayList<>());
+
+                        // Prefer the trace node's own iteration if set; otherwise, fall back
+                        int iterationValue = (node.getIteration() != null) ? node.getIteration() : totalMatches + 1;
+                        // Use the trace node's id
+                        String currentTraceId = node.getTraceID();
+                        TraceNode.VarValue varVal = new TraceNode.VarValue(currentTraceId, iterationValue, va.value);
+                        node.getJbmcValues().get(realVarName).add(varVal);
+                        System.out.println("[mergeJBMCValues] For project: " + projectId +
+                                ", added VarValue(traceId=" + currentTraceId +
+                                ", iteration=" + iterationValue + ", value='" + va.value +
+                                "') for variable '" + realVarName + "' in trace node ID='" + node.getTraceID() + "'.");
+                        foundTraceNode = true;
+                        totalMatches++;
+                        break; // Attach to the first matching TraceNode
+                    }
+                }
+            }
+            if (!foundTraceNode) {
+                System.out.println("For project: " + projectId +
+                        ", no TraceNode found for JBMC assignment at " + va.file +
+                        ":" + va.line + ", variable=" + va.variableName +
+                        " (mapped as '" + realVarName + "')");
+            }
+        }
+
+        System.out.println("[mergeJBMCValues] For project: " + projectId +
+                ", merged JBMC variable values into " + totalMatches + " trace nodes.");
+    }
+}===== ./service/Util.java =====
+package api.service;
+
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
+import com.github.javaparser.utils.ProjectRoot;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Base64;
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+public class Util {
+
+    public static ProjectRoot parseProject(File inputDir) {
+        StaticJavaParser.getConfiguration().setSymbolResolver(new JavaSymbolSolver(new CombinedTypeSolver()));
+        return new SymbolSolverCollectionStrategy().collect(inputDir.toPath());
+    }
+
+    public static List<CompilationUnit> getCUs(ProjectRoot projectRoot) {
+        return projectRoot.getSourceRoots().stream()
+                .flatMap(sr -> {
+                    try {
+                        return sr.tryToParse().stream().filter(res -> res.getResult().isPresent()).map(res -> res.getResult().get());
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                })
+                .collect(Collectors.toList());
+    }
+
+    public static String zipAndEncode(ProjectRoot projectRoot, String projectId) {
+        // This zips the instrumented code output for a specific project
+        File instrumentedDir = new File("resources/out/project-" + projectId + "/instrumented");
+        if (!instrumentedDir.exists()) {
+            throw new RuntimeException("Instrumented directory not found for project: " + projectId);
+        }
+
+        File zipFile = new File("instrumented-project-" + projectId + ".zip");
+        zipDirectory(instrumentedDir, zipFile);
+        byte[] content;
+        try {
+            content = Files.readAllBytes(zipFile.toPath());
+            // Clean up the zip file after reading it
+            Files.deleteIfExists(zipFile.toPath());
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        return Base64.getEncoder().encodeToString(content);
+    }
+
+    public static void zipDirectory(File sourceDir, File zipFile) {
+        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(zipFile))) {
+            Path sourcePath = sourceDir.toPath();
+
+            Files.walk(sourcePath)
+                    .filter(p -> !Files.isDirectory(p))
+                    .forEach(path -> {
+                        ZipEntry zipEntry = new ZipEntry(sourcePath.relativize(path).toString());
+                        try {
+                            zos.putNextEntry(zipEntry);
+                            Files.copy(path, zos);
+                            zos.closeEntry();
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static File unzipAndDecode(String base64Zip, String projectOutDir) {
+        // For simplicity, we'll just write out the zip and manually extract it
+        byte[] data = Base64.getDecoder().decode(base64Zip);
+
+        File zipFile = new File(projectOutDir, "instrumented_downloaded.zip");
+        try {
+            // Create parent directory if it doesn't exist
+            zipFile.getParentFile().mkdirs();
+            Files.write(zipFile.toPath(), data);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        File outputDir = new File(projectOutDir, "downloaded_instrumented");
+        if (!outputDir.exists()) {
+            outputDir.mkdirs();
+        }
+
+        try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new FileInputStream(zipFile))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                File newFile = new File(outputDir, entry.getName());
+                newFile.getParentFile().mkdirs();
+                try (FileOutputStream fos = new FileOutputStream(newFile)) {
+                    zis.transferTo(fos);
+                }
+            }
+            // Clean up the zip file after extraction
+            Files.deleteIfExists(zipFile.toPath());
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+        return outputDir;
+    }
+
+    public static List<CompilationUnit> loadCUs(File instrumentedDir) {
+        ProjectRoot pr = parseProject(instrumentedDir);
+        return getCUs(pr);
+    }
+
+    public static String readFileAsString(File f) {
+        try {
+            return new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static File createTempTraceFile(String content, String projectId) {
+        try {
+            File projectDir = new File("resources/out/project-" + projectId);
+            if (!projectDir.exists()) {
+                projectDir.mkdirs();
+            }
+            File f = File.createTempFile("trace-project-" + projectId + "-", ".tr", projectDir);
+            Files.write(f.toPath(), content.getBytes(StandardCharsets.UTF_8));
+            return f;
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}===== ./service/JBMCFlattenService.java =====
+package api.service;
+
+import api.service.JBMCFlattenService.FlattenedAssignment;
+import prorunvis.trace.TraceNode;
+import org.springframework.stereotype.Service;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.logging.Logger;
+
+@Service
+public class JBMCFlattenService {
+
+    private static final Logger logger = Logger.getLogger(JBMCFlattenService.class.getName());
+
+    public List<FlattenedAssignment> flatten(List<TraceNode> nodeList) {
+        logger.info("Starting flattening of " + nodeList.size() + " trace nodes.");
+        List<FlattenedAssignment> assignments = new ArrayList<>();
+        try {
+            for (TraceNode node : nodeList) {
+                if (node.getJbmcValues() != null) {
+                    node.getJbmcValues().forEach((varName, varValues) -> {
+                        for (TraceNode.VarValue val : varValues) {
+                            assignments.add(new FlattenedAssignment(node.getTraceID(), varName, val.getIteration(), val.getValue()));
+                        }
+                    });
+                }
+            }
+            logger.info("Flattening complete. Total assignments: " + assignments.size());
+        } catch (Exception e) {
+            logger.severe("Error during flattening: " + e.getMessage());
+            throw e;
+        }
+        return assignments;
+    }
+
+    public static class FlattenedAssignment {
+        private String nodeTraceId;
+        private String variableName;
+        private int iteration;
+        private String value;
+
+        public FlattenedAssignment(String nodeTraceId, String variableName, int iteration, String value) {
+            this.nodeTraceId = nodeTraceId;
+            this.variableName = variableName;
+            this.iteration = iteration;
+            this.value = value;
+        }
+
+        public String getNodeTraceId() {
+            return nodeTraceId;
+        }
+
+        public void setNodeTraceId(String nodeTraceId) {
+            this.nodeTraceId = nodeTraceId;
+        }
+
+        public String getVariableName() {
+            return variableName;
+        }
+
+        public void setVariableName(String variableName) {
+            this.variableName = variableName;
+        }
+
+        public int getIteration() {
+            return iteration;
+        }
+
+        public void setIteration(int iteration) {
+            this.iteration = iteration;
+        }
+
+        public String getValue() {
+            return value;
+        }
+
+        public void setValue(String value) {
+            this.value = value;
+        }
+    }
+}
+===== ./service/InstrumentationService.java =====
+package api.service;
+
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.utils.ProjectRoot;
+import org.springframework.stereotype.Service;
+import prorunvis.instrument.Instrumenter;
+import prorunvis.preprocess.Preprocessor;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * A reworked InstrumentationService that stores instrumented code in project-specific locations
+ */
+@Service
+public class InstrumentationService {
+
+    /**
+     * The base folder where we store each run's local data,
+     * keyed by a project ID and random instrument ID.
+     */
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    public InstrumentationService() {
+        // No repository injection needed
+    }
+
+    /**
+     * Creates/cleans project-specific output directories
+     */
+    private void ensureCleanOutputDirectories(String projectId) {
+        File outDir = new File("resources/out/project-" + projectId);
+        if (outDir.exists()) {
+            System.out.println("Cleaning existing resources/out/project-" + projectId + " directory...");
+            try {
+                Files.walk(outDir.toPath())
+                        .map(java.nio.file.Path::toFile)
+                        .sorted((o1, o2) -> -o1.compareTo(o2)) // delete children first
+                        .forEach(File::delete);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to clean output directories for project: " + projectId, e);
+            }
+        }
+        if (!outDir.mkdirs()) {
+            throw new RuntimeException("Failed to create output directory for project: " + projectId);
+        }
+
+        File instrDir = new File(outDir, "instrumented");
+        if (!instrDir.exists() && !instrDir.mkdirs()) {
+            throw new RuntimeException("Failed to create instrumented directory for project: " + projectId);
+        }
+    }
+
+    /**
+     * Instruments the code and stores results in project-specific locations
+     *
+     * @param projectName   the name of the user's project
+     * @param inputDirPath  the folder containing the source code to be instrumented
+     * @param randomId      a unique ID for this instrumentation job
+     * @param projectId     the project identifier
+     * @return Some success message (or path)
+     */
+    public String instrumentProject(String projectName,
+                                    String inputDirPath,
+                                    String randomId,
+                                    String projectId) {
+
+        // 1) Verify input directory is valid
+        File inputDir = new File(inputDirPath);
+        if (!inputDir.exists() || !inputDir.isDirectory()) {
+            throw new RuntimeException("Input directory does not exist or is not a directory: " + inputDirPath);
+        }
+
+        // 2) Clean & set up project-specific output directory
+        ensureCleanOutputDirectories(projectId);
+
+        // 3) Parse & instrument code
+        System.out.println("Parsing project at: " + inputDirPath + " for project: " + projectId);
+        ProjectRoot projectRoot = Util.parseProject(inputDir);
+        List<CompilationUnit> cus = Util.getCUs(projectRoot);
+        if (cus.isEmpty()) {
+            throw new RuntimeException("No Java files found in: " + inputDirPath);
+        }
+        System.out.println("Found " + cus.size() + " compilation units for project: " + projectId);
+
+        Map<Integer, Node> map = new HashMap<>();
+        for (CompilationUnit cu : cus) {
+            Preprocessor.run(cu);
+            Instrumenter.run(cu, map);
+        }
+
+        // 4) Save instrumented code to the project directory
+        String projectInstrDir = "resources/out/project-" + projectId + "/instrumented";
+        Instrumenter.saveInstrumented(projectRoot, projectInstrDir);
+
+        // 5) Check that something was indeed saved
+        File instrDir = new File(projectInstrDir);
+        String[] instrumentedFiles = instrDir.list();
+        if (instrumentedFiles == null || instrumentedFiles.length == 0) {
+            throw new RuntimeException("No files found in instrumented directory after saving instrumented code for project: " + projectId);
+        }
+        System.out.println("Files in instrumented directory for project: " + projectId);
+        for (String f : instrumentedFiles) {
+            System.out.println(" - " + f);
+        }
+
+        // 6) Zip & encode
+        System.out.println("Zipping instrumented code for project: " + projectId);
+        String zipBase64 = Util.zipAndEncode(projectRoot, projectId);
+        if (zipBase64 == null || zipBase64.isEmpty()) {
+            throw new RuntimeException("Failed to zip instrumented code for project: " + projectId);
+        }
+
+        // 7) Create project-specific folder structure
+        String projectBaseDir = LOCAL_STORAGE_DIR + "/project-" + projectId;
+        File projectBaseDirFile = new File(projectBaseDir);
+        if (!projectBaseDirFile.exists()) {
+            projectBaseDirFile.mkdirs();
+        }
+
+        // 8) Store in project-specific location
+        File randomIdFolder = new File(projectBaseDir, randomId);
+        if (!randomIdFolder.exists()) {
+            randomIdFolder.mkdirs();
+        }
+        File outputFile = new File(randomIdFolder, "instrumented_base64.txt");
+        try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+            fos.write(zipBase64.getBytes());
+        } catch (IOException e) {
+            throw new RuntimeException("Error writing instrumented file for project: " + projectId, e);
+        }
+
+        System.out.println("Instrumented code stored locally in: " + outputFile.getAbsolutePath() + " for project: " + projectId);
+
+        // Return a success message
+        return "Instrumented code saved under ID=" + randomId + " for project=" + projectId;
+    }
+}===== ./service/JBMCParser.java =====
+package api.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+public class JBMCParser {
+
+    public static class VarAssignment {
+        public final String variableName;
+        public final String value;
+        public final String file;
+        public final int line;
+        public final int iteration;
+
+        public VarAssignment(String variableName, String value, String file, int line, int iteration) {
+            this.variableName = variableName;
+            this.value = value;
+            this.file = file;
+            this.line = line;
+            this.iteration = iteration;
+        }
+
+        @Override
+        public String toString() {
+            return "VarAssignment{" +
+                    "variableName='" + variableName + '\'' +
+                    ", value='" + value + '\'' +
+                    ", file='" + file + '\'' +
+                    ", line=" + line +
+                    ", iteration=" + iteration +
+                    '}';
+        }
+    }
+
+    public static List<VarAssignment> parseVariableAssignments(String jbmcJson) {
+        List<VarAssignment> assignments = new ArrayList<>();
+        ObjectMapper mapper = new ObjectMapper();
+
+        try {
+            JsonNode root = mapper.readTree(jbmcJson);
+
+            if (root.isArray()) {
+                for (JsonNode element : root) {
+                    if (element.has("result")) {
+                        JsonNode resultArray = element.get("result");
+                        if (resultArray.isArray()) {
+                            for (JsonNode res : resultArray) {
+                                if (res.has("trace")) {
+                                    JsonNode traceArray = res.get("trace");
+                                    if (traceArray.isArray()) {
+                                        for (JsonNode traceStep : traceArray) {
+                                            if (traceStep.has("stepType") &&
+                                                    "assignment".equals(traceStep.get("stepType").asText())) {
+                                                String variableName = "unknown";
+                                                if (traceStep.has("variableName")) {
+                                                    variableName = traceStep.get("variableName").asText();
+                                                } else if (traceStep.has("lhs")) {
+                                                    variableName = traceStep.get("lhs").asText();
+                                                }
+
+                                                String value = "";
+                                                if (traceStep.has("value")) {
+                                                    JsonNode valueNode = traceStep.get("value");
+                                                    if (valueNode.isObject() && valueNode.has("data")) {
+                                                        value = valueNode.get("data").asText();
+                                                    } else {
+                                                        value = valueNode.asText();
+                                                    }
+                                                }
+
+                                                String file = "unknown";
+                                                int line = -1;
+                                                if (traceStep.has("sourceLocation")) {
+                                                    JsonNode sourceLoc = traceStep.get("sourceLocation");
+                                                    if (sourceLoc.has("file")) {
+                                                        file = sourceLoc.get("file").asText();
+                                                    }
+                                                    if (sourceLoc.has("line")) {
+                                                        line = sourceLoc.get("line").asInt(-1);
+                                                    }
+                                                }
+
+                                                int iteration = -1;
+                                                if (traceStep.has("iteration")) {
+                                                    iteration = traceStep.get("iteration").asInt(-1);
+                                                }
+
+                                                assignments.add(new VarAssignment(variableName, value, file, line, iteration));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to parse JBMC JSON", e);
+        }
+        return assignments;
+    }
+}
+===== ./service/JBMCException.java =====
+package api.service;
+
+/**
+ * A custom exception type for JBMC-related errors.
+ */
+public class JBMCException extends RuntimeException {
+
+    public JBMCException(String message) {
+        super(message);
+    }
+
+    public JBMCException(String message, Throwable cause) {
+        super(message, cause);
+    }
+}===== ./service/VariableNameMapper.java =====
+package api.service;
+
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ParseResult;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.body.VariableDeclarator;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.utils.SymbolSolverCollectionStrategy;
+import com.github.javaparser.utils.ProjectRoot;
+import com.github.javaparser.utils.SourceRoot;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.*;
+
+public class VariableNameMapper {
+
+    private final Map<String, Map<Integer, List<String>>> varDecls = new HashMap<>();
+
+    public void buildVarNameMapping(Path sourceDir) throws IOException {
+        StaticJavaParser.getConfiguration().setSymbolResolver(
+                new JavaSymbolSolver(new CombinedTypeSolver())
+        );
+
+        SourceRoot sourceRoot = new SourceRoot(sourceDir);
+
+        sourceRoot.parse("", (localPath, absolutePath, parseResult) -> {
+            parseResult.getResult().ifPresent(cu -> {
+                String relativePath = localPath.toString();
+                recordVariableDeclarations(cu, relativePath);
+            });
+            return SourceRoot.Callback.Result.DONT_SAVE;
+        });
+    }
+
+    private void recordVariableDeclarations(CompilationUnit cu, String relativePath) {
+        String simpleFile = extractSimpleFileName(relativePath);
+        cu.findAll(VariableDeclarator.class).forEach(varDecl -> {
+            varDecl.getName().getRange().ifPresent(range -> {
+                int line = range.begin.line;
+                String varName = varDecl.getNameAsString();
+                varDecls
+                        .computeIfAbsent(simpleFile, k -> new HashMap<>())
+                        .computeIfAbsent(line, k -> new ArrayList<>())
+                        .add(varName);
+            });
+        });
+    }
+
+    private String extractSimpleFileName(String pathString) {
+        File f = new File(pathString);
+        return f.getName();
+    }
+
+    public Map<String, Map<Integer, List<String>>> getVarDeclMap() {
+        return varDecls;
+    }
+}
+===== ./service/VisualizationService.java =====
+package api.service;
+
+import org.springframework.stereotype.Service;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+
+/**
+ * Reworked VisualizationService to read from project-specific locations
+ */
+@Service
+public class VisualizationService {
+
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    public VisualizationService() {
+        // no repos needed
+    }
+
+    public String getTraceJson(String localId, String projectId) {
+        // find resources/local_storage/project-<projectId>/<localId>/processedTrace.json
+        File localFolder = new File(LOCAL_STORAGE_DIR + "/project-" + projectId, localId);
+        if (!localFolder.exists() || !localFolder.isDirectory()) {
+            throw new RuntimeException("Local ID folder not found for project: " + projectId +
+                    " at: " + localFolder.getAbsolutePath());
+        }
+        File processedFile = new File(localFolder, "processedTrace.json");
+        if (!processedFile.exists()) {
+            throw new RuntimeException("No processedTrace.json found for ID: " + localId +
+                    " in project: " + projectId);
+        }
+
+        try {
+            byte[] content = Files.readAllBytes(processedFile.toPath());
+            return new String(content, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read processedTrace.json for project: " + projectId, e);
+        }
+    }
+}===== ./service/JBMCService.java =====
+package api.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.stereotype.Service;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * JBMCService spawns JBMC processes, captures their JSON output,
+ * and parses variable assignments.
+ */
+@Service
+public class JBMCService {
+
+    // Directory where JBMC JSON output is stored (keyed by projectId/localId)
+    private static final String LOCAL_STORAGE_DIR = "resources/local_storage";
+
+    /**
+     * Run JBMC on a specific method signature, using the compiled .class files
+     * from the project-specific directory.
+     *
+     * @param localId         A unique identifier to store JBMC output.
+     * @param methodSignature The fully qualified method signature for JBMC.
+     * @param maxUnwind       The maximum unwind value.
+     * @param maxArrayLength  The maximum nondeterministic array length.
+     * @param projectId       The project identifier
+     */
+    public void runJBMC(String localId,
+                        String methodSignature,
+                        int maxUnwind,
+                        int maxArrayLength,
+                        String projectId) {
+
+        System.out.println("DEBUG JBMCService.runJBMC: localId=" + localId
+                + ", projectId=" + projectId
+                + ", methodSignature=" + methodSignature
+                + ", unwind=" + maxUnwind
+                + ", maxArrayLength=" + maxArrayLength);
+
+        // Prepare the project-specific local storage folder
+        File localFolder = new File(LOCAL_STORAGE_DIR + "/project-" + projectId, localId);
+        if (!localFolder.exists() && !localFolder.mkdirs()) {
+            throw new JBMCException("Failed to create project storage directory at: " + localFolder.getAbsolutePath());
+        }
+
+        // Use the project-specific compiled directory
+        File compiledDir = new File("resources/out/project-" + projectId + "/downloaded_instrumented/compiled");
+        System.out.println("DEBUG: compiledDir=" + compiledDir.getAbsolutePath()
+                + ", exists? " + compiledDir.exists());
+        if (!compiledDir.exists()) {
+            throw new JBMCException("No compiled directory found at: " + compiledDir.getAbsolutePath());
+        }
+
+        // Build the JBMC command
+        String jbmcPath = "jbmc"; // or set an absolute path to the jbmc binary
+        String[] cmd = new String[] {
+                jbmcPath,
+                methodSignature,
+                "--classpath", compiledDir.getAbsolutePath(),
+                "--unwind", String.valueOf(maxUnwind),
+                "--unwinding-assertions",
+                "--disable-uncaught-exception-check",
+                "--throw-runtime-exceptions",
+                "--max-nondet-array-length", String.valueOf(maxArrayLength),
+                "--json-ui",
+        };
+
+        System.out.println("DEBUG: about to run JBMC with command: " + String.join(" ", cmd) + " for project: " + projectId);
+
+        // Rest of the method (process handling, output capture, etc.)
+        Process process;
+        try {
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.directory(compiledDir);
+            process = pb.start();
+            System.out.println("DEBUG: JBMC process started for project: " + projectId);
+        } catch (IOException e) {
+            System.out.println("DEBUG ERROR: Could not start JBMC process for project: " + projectId + ", error: " + e.getMessage());
+            throw new JBMCException("Failed to start JBMC process: " + e.getMessage(), e);
+        }
+
+        // Capture the JBMC JSON output
+        StringBuilder jbmcOutput = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                jbmcOutput.append(line).append("\n");
+            }
+        } catch (IOException e) {
+            System.out.println("DEBUG ERROR: Could not read JBMC stdout for project: " + projectId + ", error: " + e.getMessage());
+            throw new JBMCException("Failed reading JBMC output: " + e.getMessage(), e);
+        }
+
+        // Wait for the JBMC process to finish
+        try {
+            int exitCode = process.waitFor();
+            System.out.println("DEBUG: JBMC exit code=" + exitCode + " for project: " + projectId);
+            // Allow exit codes 0 (no counterexample) and 10 (counterexample found)
+            if (exitCode != 0 && exitCode != 10) {
+                // Read error stream
+                StringBuilder errStr = new StringBuilder();
+                try (BufferedReader errBr = new BufferedReader(
+                        new InputStreamReader(process.getErrorStream(), StandardCharsets.UTF_8))) {
+                    String errLine;
+                    while ((errLine = errBr.readLine()) != null) {
+                        errStr.append(errLine).append("\n");
+                    }
+                } catch (IOException ee) {
+                    throw new JBMCException("Failed reading JBMC error output: " + ee.getMessage(), ee);
+                }
+                throw new JBMCException("JBMC process returned unexpected exit code " + exitCode
+                        + " for project: " + projectId + ". Error: " + errStr);
+            }
+        } catch (InterruptedException e) {
+            System.out.println("DEBUG ERROR: JBMC process interrupted for project: " + projectId + ", error: " + e.getMessage());
+            throw new JBMCException("JBMC process was interrupted: " + e.getMessage(), e);
+        }
+
+        // Save the raw JBMC JSON to project-specific location
+        File jbmcJsonFile = new File(localFolder, "jbmcOutput.json");
+        System.out.println("DEBUG: writing JBMC result to " + jbmcJsonFile.getAbsolutePath() + " for project: " + projectId);
+        try (FileOutputStream fos = new FileOutputStream(jbmcJsonFile)) {
+            fos.write(jbmcOutput.toString().getBytes(StandardCharsets.UTF_8));
+        } catch (IOException e) {
+            System.out.println("DEBUG ERROR: Could not write jbmcOutput.json for project: " + projectId + ", error: " + e.getMessage());
+            throw new JBMCException("Failed to write JBMC JSON to file: " + e.getMessage(), e);
+        }
+
+        // Optionally parse the JSON
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(jbmcOutput.toString());
+            System.out.println("DEBUG: JBMC JSON root parsed for project: " + projectId + ", top-level fields:");
+            root.fieldNames().forEachRemaining(System.out::println);
+        } catch (IOException e) {
+            System.out.println("DEBUG ERROR: Could not parse JBMC JSON for project: " + projectId + ", error: " + e.getMessage());
+            throw new JBMCException("Failed to parse JBMC JSON: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Return the raw JBMC JSON from project-specific location,
+     * so the frontend can display or further process it.
+     */
+    public String getJBMCOutput(String localId, String projectId) {
+        File localFolder = new File(LOCAL_STORAGE_DIR + "/project-" + projectId, localId);
+        File jbmcJsonFile = new File(localFolder, "jbmcOutput.json");
+        System.out.println("DEBUG JBMCService.getJBMCOutput: localId=" + localId
+                + ", projectId=" + projectId
+                + ", file=" + jbmcJsonFile.getAbsolutePath()
+                + ", exists? " + jbmcJsonFile.exists());
+
+        if (!jbmcJsonFile.exists()) {
+            throw new JBMCException("No jbmcOutput.json found for ID: " + localId + " in project: " + projectId);
+        }
+
+        try {
+            byte[] data = java.nio.file.Files.readAllBytes(jbmcJsonFile.toPath());
+            return new String(data, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new JBMCException("Failed to read jbmcOutput.json for project: " + projectId, e);
+        }
+    }
+}===== ./ProRunVisAPI.java =====
+package api;
+
+import api.upload.storage.StorageProperties;
+import api.upload.storage.StorageService;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+
+@SpringBootApplication
+@EnableConfigurationProperties(StorageProperties.class)
+public class ProRunVisAPI {
+
+    /**
+     * Starts a {@link SpringApplication} on localhost.
+     * @param args the argument list for the program.
+     */
+    public static void main(final String[] args) {
+        SpringApplication.run(ProRunVisAPI.class, args);
+    }
+
+    /**
+     * Automated initialization for a {@link StorageService} used
+     * by this {@link SpringApplication}.
+     * @param storageService the {@link StorageService} to
+     *                       initialize.
+     * @return a function calling the <code>deleteAll()</code>
+     *         and <code>init()</code> methods of the storageService
+     */
+    @Bean
+    CommandLineRunner init(final StorageService storageService) {
+        return (args) -> {
+            storageService.deleteAll();
+            storageService.init();
+        };
+    }
+}
+===== ./upload/storage/FileSystemStorageService.java =====
+// FileSystemStorageService.java
+package api.upload.storage;
+
+import jakarta.servlet.http.Part;
+import org.apache.commons.io.FilenameUtils;
+import org.springframework.stereotype.Service;
+import org.springframework.util.FileSystemUtils;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+
+@Service
+public class FileSystemStorageService implements StorageService {
+    private final Path rootLocation;
+    private final Path outLocation;
+    private final Path localStorageLocation;
+
+    public FileSystemStorageService(final StorageProperties properties) {
+        if (properties.getLocation().trim().isEmpty()) {
+            throw new StorageException("File storage directory cannot be empty.");
+        }
+        this.rootLocation = Paths.get(properties.getLocation());
+        if (properties.getOutLocation().trim().isEmpty()) {
+            this.outLocation = Paths.get("resources/out");
+        } else {
+            this.outLocation = Paths.get(properties.getOutLocation());
+        }
+        this.localStorageLocation = Paths.get("resources/local_storage");
+    }
+
+    @Override
+    public void init() {
+        try {
+            Files.createDirectories(rootLocation);
+            Files.createDirectories(outLocation);
+            Files.createDirectories(localStorageLocation);
+        } catch (IOException e) {
+            throw new StorageException("Could not create directory.", e);
+        }
+    }
+
+    @Override
+    public void initProject(String projectId) {
+        try {
+            Path projectInPath = getProjectInPath(projectId);
+            Path projectOutPath = getProjectOutPath(projectId);
+            Path projectLocalStoragePath = getProjectLocalStoragePath(projectId);
+
+            Files.createDirectories(projectInPath);
+            Files.createDirectories(projectOutPath);
+            Files.createDirectories(projectLocalStoragePath);
+
+            System.out.println("Initialized directories for project: " + projectId);
+            System.out.println("  - Input: " + projectInPath);
+            System.out.println("  - Output: " + projectOutPath);
+            System.out.println("  - Local Storage: " + projectLocalStoragePath);
+        } catch (IOException e) {
+            throw new StorageException("Could not create project directories for project: " + projectId, e);
+        }
+    }
+
+    private Path getProjectInPath(String projectId) {
+        return rootLocation.resolve("project-" + projectId);
+    }
+
+    private Path getProjectOutPath(String projectId) {
+        return outLocation.resolve("project-" + projectId);
+    }
+
+    private Path getProjectLocalStoragePath(String projectId) {
+        return localStorageLocation.resolve("project-" + projectId);
+    }
+
+    @Override
+    public String getProjectInLocation(String projectId) {
+        return getProjectInPath(projectId).toString();
+    }
+
+    @Override
+    public String getProjectOutLocation(String projectId) {
+        return getProjectOutPath(projectId).toString();
+    }
+
+    @Override
+    public String getProjectLocalStorageLocation(String projectId) {
+        return getProjectLocalStoragePath(projectId).toString();
+    }
+
+    @Override
+    public void store(final Part part, final String projectId) {
+        try {
+            String fileName = FilenameUtils.separatorsToSystem(part.getSubmittedFileName());
+            Path projectPath = getProjectInPath(projectId);
+            Path file = projectPath.resolve(fileName);
+
+            if (Files.notExists(file.getParent())) {
+                Files.createDirectories(file.getParent());
+            }
+            try (InputStream inputStream = part.getInputStream()) {
+                Files.copy(inputStream, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+            System.out.println("Stored file " + fileName + " for project: " + projectId + " at: " + file);
+        } catch (IOException e) {
+            throw new StorageException("Could not store file for project: " + projectId, e);
+        }
+    }
+
+
+    public void store(final Part part) {
+        throw new StorageException("Project ID is required for file storage. Use store(part, projectId) instead.");
+    }
+
+    @Override
+    public void deleteAll() {
+        FileSystemUtils.deleteRecursively(rootLocation.toFile());
+        FileSystemUtils.deleteRecursively(outLocation.toFile());
+        FileSystemUtils.deleteRecursively(localStorageLocation.toFile());
+        try {
+            Files.createDirectories(rootLocation);
+            Files.createDirectories(outLocation);
+            Files.createDirectories(localStorageLocation);
+        } catch (IOException e) {
+            throw new StorageException("Could not recreate directories after deletion.", e);
+        }
+    }
+
+    @Override
+    public void deleteAllForProject(String projectId) {
+        Path projectInPath = getProjectInPath(projectId);
+        Path projectOutPath = getProjectOutPath(projectId);
+        Path projectLocalStoragePath = getProjectLocalStoragePath(projectId);
+
+        System.out.println("Deleting files for project: " + projectId);
+        FileSystemUtils.deleteRecursively(projectInPath.toFile());
+        FileSystemUtils.deleteRecursively(projectOutPath.toFile());
+
+        try {
+            Files.createDirectories(projectInPath);
+            Files.createDirectories(projectOutPath);
+            Files.createDirectories(projectLocalStoragePath);
+        } catch (IOException e) {
+            throw new StorageException("Could not recreate project directories after deletion for project: " + projectId, e);
+        }
+    }
+}===== ./upload/storage/StorageProperties.java =====
+package api.upload.storage;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+/**
+ * A property element to define a storage configuration.
+ */
+@ConfigurationProperties("storage")
+public class StorageProperties {
+
+    /**
+     * The location where newly uploaded files will be stored.
+     */
+    private String inLocation = "resources/in";
+
+    /**
+     * The location to use as storage for temporary output files.
+     */
+    private String outLocation = "resources/out";
+
+    /**
+     * Gets the {@code inLocation} field of this property object.
+     *
+     * @return The String representing the relative path to the
+     * inLocation.
+     */
+    public String getLocation() {
+        return this.inLocation;
+    }
+
+    /**
+     * Sets the {@code inLocation} field of this property element.
+     *
+     * @param location The String to set as inLocation.
+     */
+    public void setLocation(final String location) {
+        this.inLocation = location;
+    }
+
+    /**
+     * Gets the {@code outLocation} field of this property object.
+     *
+     * @return The String representing the relative path to the
+     * outLocation.
+     */
+    public String getOutLocation() {
+        return this.outLocation;
+    }
+
+    /**
+     * Sets the {@code outLocation} field of this property element.
+     *
+     * @param location The String to set as outLocation.
+     */
+    public void setOutLocation(final String location) {
+        this.outLocation = location;
+    }
+}
+===== ./upload/storage/StorageException.java =====
+package api.upload.storage;
+
+/**
+ * Signals that a storage exception has occurred.
+ */
+public class StorageException extends RuntimeException {
+
+    /**
+     * Constructs a StorageException with the specified detail message.
+     *
+     * @param message The detail message (which is saved for later retrieval
+     *                by the {@link #getMessage()} method)
+     */
+    public StorageException(final String message) {
+        super(message);
+    }
+
+    /**
+     * Constructs a StorageException with the specified detail message
+     * and cause.
+     *
+     * @param message The detail message (which is saved for later retrieval
+     *                by the {@link #getMessage()} method)
+     * @param cause   The cause (which is saved for later retrieval by the
+     *                {@link #getCause()} method).  (A null value is permitted,
+     *                and indicates that the cause is nonexistent or unknown.)
+     */
+    public StorageException(final String message, final Throwable cause) {
+        super(message, cause);
+    }
+}
+===== ./upload/storage/StorageService.java =====
+package api.upload.storage;
+
+import jakarta.servlet.http.Part;
+
+/**
+ * A Service for storing data provided from a http request.
+ * The user of this interface can create and delete all
+ * necessary directories and has control of the way each {@link Part}
+ * of the request is stored.
+ */
+public interface StorageService {
+
+    /**
+     * Initializes the storage location and structure used by this storage
+     * service element.
+     */
+    void init();
+
+    /**
+     * Initializes storage for a specific project
+     *
+     * @param projectId The unique project identifier
+     */
+    void initProject(String projectId);
+
+    /**
+     * Stores data to the project-specific storage location.
+     * @param part The data to store. The data is provided in form of a
+     *             {@link Part} from a http request.
+     * @param projectId The project identifier to associate the stored data with
+     */
+    void store(Part part, String projectId);
+
+    /**
+     * Deletes all data stored by this storage service or storage services
+     * which are providing the same storage location.
+     */
+    void deleteAll();
+
+    /**
+     * Deletes all data for a specific project
+     *
+     * @param projectId The project identifier whose data should be deleted
+     */
+    void deleteAllForProject(String projectId);
+
+    /**
+     * Gets the input location path for a specific project
+     *
+     * @param projectId The project identifier
+     * @return The path to the project's input location
+     */
+    String getProjectInLocation(String projectId);
+
+    /**
+     * Gets the output location path for a specific project
+     *
+     * @param projectId The project identifier
+     * @return The path to the project's output location
+     */
+    String getProjectOutLocation(String projectId);
+
+    /**
+     * Gets the local storage path for a specific project
+     *
+     * @param projectId The project identifier
+     * @return The path to the project's local storage location
+     */
+    String getProjectLocalStorageLocation(String projectId);
+}===== ./upload/UploadController.java =====
+// UploadController.java
+package api.upload;
+
+import api.upload.storage.StorageException;
+import api.upload.storage.StorageService;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.Part;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.*;
+
+import java.io.IOException;
+
+@Controller
+public class UploadController {
+    private final StorageService storageService;
+
+    @Autowired
+    public UploadController(final StorageService storageService) {
+        this.storageService = storageService;
+    }
+
+    /**
+     * GET /?projectId=<projectId>
+     * Hosts the landing page after ensuring the project directories are initialized.
+     */
+    @GetMapping("/")
+    public String getIndex(HttpServletResponse response,
+                           @RequestParam(required = false) String projectId) {
+        if (projectId == null || projectId.isEmpty()) {
+            return "redirect:/new-project";
+        }
+        storageService.initProject(projectId);
+        response.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        response.setHeader("Pragma", "no-cache");
+        response.setHeader("Expires", "0");
+        return "index.html";
+    }
+
+    /**
+     * POST /api/upload
+     * Handles file uploads to a project-specific folder.
+     */
+    @PostMapping("/api/upload")
+    @ResponseBody
+    public String handleUpload(final HttpServletRequest request) {
+        String projectId = request.getParameter("projectId");
+        if (projectId == null || projectId.isEmpty()) {
+            throw new StorageException("No project ID provided. Please specify a project ID.");
+        }
+        storageService.deleteAllForProject(projectId);
+        try {
+            for (Part part : request.getParts()) {
+                // Skip the part if its name is "projectId"
+                if ("projectId".equals(part.getName())) {
+                    continue;
+                }
+                storageService.store(part, projectId);
+            }
+        } catch (IOException | ServletException e) {
+            throw new StorageException("No files for upload selected.", e);
+        }
+        return "Upload successful for project: " + projectId;
+    }
+
+    @ExceptionHandler(StorageException.class)
+    @ResponseBody
+    public String handleException(final StorageException e) {
+        String error = e.getMessage() + "\n";
+        if (e.getCause() != null) {
+            error += "\n" + e.getCause() + "\n";
+        }
+        return error;
+    }
+}
