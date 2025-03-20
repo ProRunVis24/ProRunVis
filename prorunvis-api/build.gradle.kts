@@ -4,6 +4,15 @@ plugins {
     id ("java")
 }
 
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(17))
+    }
+}
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
 
 apply(plugin = "io.spring.dependency-management")
 
@@ -22,7 +31,7 @@ dependencies {
     //spring boot
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-actuator")
-    implementation(platform("org.springframework.boot:spring-boot-dependencies:2.7.8"))
+    // Removed conflicting platform dependency
 
     //commons
     implementation("commons-io:commons-io:2.15.1")
